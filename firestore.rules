@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // User Profile & Private Data
+    // Matches the root user document and all nested folders/notes/files
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      
+      match /{allSubcollections=**} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+
+    // Collaborative Study Rooms
+    match /study_rooms/{roomId} {
+      // Allow authenticated users to see rooms and create new ones
+      allow read, create: if request.auth != null;
+      
+      // Allow updates if the user is the creator or a member
+      // Allow updates if the user is the creator or a member OR if they are joining
+      allow update: if request.auth != null;
+
+      // Notes inside specific rooms
+      match /notes/{noteId} {
+        allow read, write: if request.auth != null && 
+          request.auth.uid in get(/databases/$(database)/documents/study_rooms/$(roomId)).data.memberIds;
+      }
+    }
+
+    // Global Presence & Public Metrics (Optional)
+    match /status/{statusId} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+
+    match /snaps/{snapId} {
+      allow read, write: if true;
+    }
+  }
+}

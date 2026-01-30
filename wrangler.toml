@@ -1,0 +1,7 @@
+name = "lecturesnap-worker"
+main = "worker.js"
+compatibility_date = "2023-12-01"
+
+[vars]
+# We will set secrets via wrangler secret put
+

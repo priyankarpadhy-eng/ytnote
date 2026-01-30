@@ -1,0 +1,79 @@
+{
+    "manifest_version": 3,
+    "name": "LectureSnap Sidekick",
+    "version": "1.1",
+    "description": "Capture YouTube video frames instantly with Shift+S. Perfect for taking notes from online lectures without pausing.",
+    "permissions": [
+        "sidePanel",
+        "activeTab",
+        "declarativeNetRequest"
+    ],
+    "host_permissions": [
+        "*://*.youtube.com/*",
+        "*://*.lecturesnap.online/*",
+        "*://lecturesnaap.web.app/*",
+        "http://localhost/*"
+    ],
+    "action": {
+        "default_title": "Open Study Companion"
+    },
+    "side_panel": {
+        "default_path": "sidepanel.html"
+    },
+    "background": {
+        "service_worker": "background.js"
+    },
+    "declarative_net_request": {
+        "rule_resources": [
+            {
+                "id": "ruleset_1",
+                "enabled": true,
+                "path": "rules.json"
+            }
+        ]
+    },
+    "commands": {
+        "_execute_action": {
+            "suggested_key": {
+                "default": "Ctrl+Shift+S",
+                "mac": "MacCtrl+Shift+S"
+            },
+            "description": "Open/Close Sidebar"
+        },
+        "capture_note": {
+            "suggested_key": {
+                "default": "Alt+S",
+                "mac": "Alt+S"
+            },
+            "description": "Snap a note (Global Backup)"
+        }
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "*://*.youtube.com/*"
+            ],
+            "js": [
+                "content.js"
+            ]
+        },
+        {
+            "matches": [
+                "*://lecturesnaap.web.app/*",
+                "*://*.lecturesnap.online/*",
+                "http://localhost/*"
+            ],
+            "js": [
+                "website-content.js"
+            ],
+            "run_at": "document_start"
+        }
+    ],
+    "externally_connectable": {
+        "matches": [
+            "*://lecturesnaap.web.app/*",
+            "*://*.lecturesnap.online/*",
+            "http://localhost/*"
+        ]
+    }
+}
