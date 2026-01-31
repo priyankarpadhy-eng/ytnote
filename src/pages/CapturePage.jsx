@@ -39,18 +39,26 @@ export default function CapturePage() {
 
     // Extension Check
     useEffect(() => {
-        const checkExtension = () => {
-            window.postMessage({ type: "LECTURESNAP_PING" }, "*");
-        };
+        let pingInterval;
         const handleMessage = (event) => {
             if (event.data.type === "LECTURESNAP_PONG") {
                 setHasExtension(true);
-                setScanMethod('extension'); // Prefer extension if found
+                setScanMethod('extension');
+                clearInterval(pingInterval);
             }
         };
+
         window.addEventListener('message', handleMessage);
-        checkExtension();
-        return () => window.removeEventListener('message', handleMessage);
+
+        // Ping every second until we get a response
+        pingInterval = setInterval(() => {
+            window.postMessage({ type: "LECTURESNAP_PING" }, "*");
+        }, 1000);
+
+        return () => {
+            window.removeEventListener('message', handleMessage);
+            clearInterval(pingInterval);
+        };
     }, []);
 
     // Scroll Listener for Floating Status
@@ -211,8 +219,15 @@ export default function CapturePage() {
 
     const runScan = () => {
         if (!url) { setError('Please enter a URL'); return; }
-        if (scanMethod === 'extension') handleExtensionScan();
-        else handleScan();
+        if (scanMethod === 'extension') {
+            if (!hasExtension) {
+                setError('Sidekick Extension not detected. Please install/reload it and refresh this page.');
+                return;
+            }
+            handleExtensionScan();
+        } else {
+            handleScan();
+        }
     };
 
 

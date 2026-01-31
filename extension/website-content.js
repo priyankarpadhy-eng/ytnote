@@ -3,9 +3,8 @@ console.log("LectureSnap Website Bridge Loaded ✅");
 
 // 1. Listen for messages from the Web App (CapturePage.jsx)
 window.addEventListener("message", (event) => {
-    // Basic origin filtering
-    const allowedOrigins = ['https://lecturesnap.online', 'http://localhost:5173', 'https://lecturesnaap.web.app'];
-    if (!allowedOrigins.includes(event.origin)) return;
+    // Basic filtering to ensure we only handle LectureSnap messages
+    if (!event.data || typeof event.data !== 'object') return;
 
     // Handle Ping
     if (event.data.type === "LECTURESNAP_PING") {
