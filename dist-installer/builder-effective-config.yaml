@@ -1,0 +1,38 @@
+directories:
+  output: dist-installer
+  buildResources: build
+appId: com.lecturesnap.app
+productName: LectureSnap Desktop
+copyright: Copyright © 2026 LectureSnap Inc
+asar: false
+files:
+  - filter:
+      - dist/**/*
+      - electron/**/*
+      - server/**/*
+      - package.json
+      - '!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}'
+      - '!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}'
+      - '!**/node_modules/*.d.ts'
+      - '!**/node_modules/.bin'
+      - '!src/*'
+      - '!public/*'
+      - '!vite.config.js'
+      - '!index.html'
+win:
+  target: nsis
+  icon: public/favicon.ico
+  legalTrademarks: LectureSnap
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: LectureSnap
+  installerIcon: public/favicon.ico
+  uninstallerIcon: public/favicon.ico
+  installerHeaderIcon: public/favicon.ico
+  deleteAppDataOnUninstall: true
+  runAfterFinish: true
+electronVersion: 40.1.0

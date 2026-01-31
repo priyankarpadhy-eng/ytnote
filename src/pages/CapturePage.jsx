@@ -1,11 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import { ArrowLeft, Camera, Loader2, Link as LinkIcon, Image as ImageIcon, Save, FileText, Trash2, CheckCircle } from 'lucide-react';
+import {
+    ArrowLeft, Link as LinkIcon, Save, FileText, Trash2,
+    CheckCircle, Zap, Loader, X, MoreVertical, LayoutGrid, Image
+} from 'lucide-react';
 import { db } from '../lib/firebase';
-import { collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
+import { collection, query, orderBy, limit, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
 import { PdfExportOptionsModal } from '../components/PdfExportOptionsModal';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+// --- CONFIG ---
+// Allow swapping backend URL for Railway
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
 
 export default function CapturePage() {
     const [url, setUrl] = useState('');
@@ -17,21 +22,27 @@ export default function CapturePage() {
     // Local Session State
     const [scanProgress, setScanProgress] = useState(0);
     const [scanStatus, setScanStatus] = useState('');
-    const [scannedImages, setScannedImages] = useState([]); // { url, ts, phash, diff }
+    const [scannedImages, setScannedImages] = useState([]); // { url, ts, phash, id }
 
     // UI State
     const [autoScrollEnabled, setAutoScrollEnabled] = useState(true);
-    const [showFloatingStatus, setShowFloatingStatus] = useState(false);
     const [isPdfModalOpen, setIsPdfModalOpen] = useState(false);
-
-    // Permission Modal State
-    const [showPermissionModal, setShowPermissionModal] = useState(!localStorage.getItem('permission_explained'));
+    const [showFloatingStatus, setShowFloatingStatus] = useState(false);
 
     const bottomRef = useRef(null);
     const autoScrollRef = useRef(true);
 
     // Sync Ref
     useEffect(() => { autoScrollRef.current = autoScrollEnabled; }, [autoScrollEnabled]);
+
+    // Scroll Listener for Floating Status
+    useEffect(() => {
+        const handleScroll = () => {
+            setShowFloatingStatus(window.scrollY > 100);
+        };
+        window.addEventListener('scroll', handleScroll);
+        return () => window.removeEventListener('scroll', handleScroll);
+    }, []);
 
     // Load Saved Snaps
     useEffect(() => {
@@ -40,23 +51,12 @@ export default function CapturePage() {
             const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
             setSnaps(data);
         });
-
-        // Scroll Listener
-        const handleScroll = () => {
-            setShowFloatingStatus(window.scrollY > 100);
-        };
-        window.addEventListener('scroll', handleScroll);
-        return () => {
-            unsubscribe();
-            window.removeEventListener('scroll', handleScroll);
-        };
+        return () => unsubscribe();
     }, []);
 
-    const handleDismissPermissionMatches = () => {
-        localStorage.setItem('permission_explained', 'true');
-        setShowPermissionModal(false);
-    }
-
+    // --------------------------------------------------------------------------------
+    // CORE LOGIC (PARALLEL SCANNER)
+    // --------------------------------------------------------------------------------
     const handleScan = async () => {
         if (!url || (!url.includes('youtube.com') && !url.includes('youtu.be'))) {
             setError('Please enter a valid YouTube URL');
@@ -66,17 +66,15 @@ export default function CapturePage() {
         setLoading(true);
         setStatus('SCANNING');
         setError(null);
-        setScannedImages([]); // Clear previous local session
+        setScannedImages([]);
         setScanProgress(0);
 
         try {
             // STEP 1: PROBE METADATA
-            setScanStatus("Probing video metadata...");
-            const metaRes = await fetch(`${API_BASE}/meta?url=${encodeURIComponent(url)}`);
-            if (!metaRes.ok) throw new Error("Failed to get video duration");
+            setScanStatus("Connecting to Neural Engine...");
+            const metaRes = await fetch(`${BACKEND_URL}/meta?url=${encodeURIComponent(url)}`);
+            if (!metaRes.ok) throw new Error("Could not connect to scanner backend. Is it running?");
             const { duration, interval } = await metaRes.json();
-
-            console.log(`Duration: ${duration}s, Suggested Interval: ${interval}s`);
 
             // ETA Helper
             let startTime = Date.now();
@@ -87,19 +85,15 @@ export default function CapturePage() {
                 return `${m}:${sec.toString().padStart(2, '0')}`;
             };
 
-            // STEP 2: DETERMINE WORKERS
-            // Scaling Logic:
-            // > 20 mins: 4 Workers (Maximum Parallelism)
+            // STEP 2: DETERMINE PARALLEL WORKERS
+            // > 20 mins: 4 Workers (Max Speed)
             // > 5 mins: 2 Workers
-            // < 5 mins: 1 Worker
             let numWorkers = 1;
             if (duration > 1200) numWorkers = 4;
             else if (duration > 300) numWorkers = 2;
 
             const chunkDuration = Math.ceil(duration / numWorkers);
-
-            console.log(`Starting ${numWorkers} parallel scan workers. Chunk size: ${chunkDuration}s`);
-            setScanStatus(`Starting ${numWorkers} parallel scanners...`);
+            setScanStatus(`Initializing ${numWorkers} parallel cores...`);
 
             // Worker State Tracking
             let activeWorkers = numWorkers;
@@ -110,46 +104,37 @@ export default function CapturePage() {
             for (let i = 0; i < numWorkers; i++) {
                 const start = i * chunkDuration;
                 const end = Math.min((i + 1) * chunkDuration, duration);
-                const scanUrl = `${API_BASE}/scan?url=${encodeURIComponent(url)}&start=${start}&end=${end}`;
+                const scanUrl = `${BACKEND_URL}/scan?url=${encodeURIComponent(url)}&start=${start}&end=${end}`;
 
-                console.log(`Worker ${i}: ${start}-${end}s`);
                 const es = new EventSource(scanUrl);
                 connections.push(es);
 
-                es.onopen = () => {
-                    console.log(`Worker ${i} connected.`);
-                    if (i === 0) startTime = Date.now();
-                };
+                es.onopen = () => { if (i === 0) startTime = Date.now(); };
 
                 es.onmessage = (event) => {
                     const data = JSON.parse(event.data);
 
                     if (data.error) {
-                        console.error(`Worker ${i} error:`, data.error);
                         es.close();
-                        setError(data.error);
-                        setLoading(false);
-                        setStatus('ERROR');
-                        connections.forEach(c => c.close());
+                        // Only fail if all fail, but for now simple fail
+                        console.error(data.error);
                         return;
                     }
 
-                    // Progress or Image Update
                     if (data.type === 'progress' || data.type === 'image') {
                         workerProgress[i] = data.progress;
 
-                        // Calculate Total Progress across all workers
+                        // Calculate Total Progress
                         const totalProgress = workerProgress.reduce((a, b) => a + b, 0) / numWorkers;
                         setScanProgress(totalProgress);
 
-                        // ETA Calc
+                        // ETA
                         let etaString = '';
                         if (totalProgress > 1 && totalProgress < 100) {
                             const elapsed = (Date.now() - startTime) / 1000;
-                            const rate = totalProgress / elapsed; // percent per second
-                            const remainingPercent = 100 - totalProgress;
-                            const remainingSeconds = remainingPercent / rate;
-                            etaString = ` • ETA: ~${formatTime(remainingSeconds)}`;
+                            const rate = totalProgress / elapsed;
+                            const remaining = (100 - totalProgress) / rate;
+                            etaString = ` • ETA ~${formatTime(remaining)}`;
                         }
 
                         if (data.type === 'progress') {
@@ -157,13 +142,12 @@ export default function CapturePage() {
                         } else {
                             // Image Found
                             setScanStatus(`Captured Slide at ${data.timestamp}s${etaString}`);
-
                             setScannedImages(prev => {
                                 const newImg = {
                                     url: data.imageUrl,
                                     ts: data.timestamp,
                                     phash: data.phash,
-                                    id: Date.now() + Math.random().toString()
+                                    id: Math.random().toString(36).substr(2, 9)
                                 };
                                 return [...prev, newImg].sort((a, b) => a.ts - b.ts);
                             });
@@ -175,26 +159,16 @@ export default function CapturePage() {
                     }
 
                     if (data.type === 'done') {
-                        console.log(`Worker ${i} finished.`);
                         es.close();
                         activeWorkers--;
                         workerProgress[i] = 100;
 
                         if (activeWorkers <= 0) {
-                            setScanStatus(`Scan Complete! All segments finished.`);
+                            setScanStatus(`Completed`);
                             setStatus('DONE');
                             setLoading(false);
                             setScanProgress(100);
                         }
-                    }
-                };
-
-                es.onerror = (err) => {
-                    if (es.readyState === EventSource.CLOSED) {
-                        // Normal close
-                    } else {
-                        // Error - but we let browser retry logic handle minor bumps
-                        console.warn(`Worker ${i} connection hiccup`, err);
                     }
                 };
             }
@@ -207,92 +181,80 @@ export default function CapturePage() {
         }
     };
 
-    // AI Smart Clean (Local Version) - IMPROVED
+    // --------------------------------------------------------------------------------
+    // SMART TOOLS (AI Clean, Upload, PDF)
+    // --------------------------------------------------------------------------------
+
+    // AI Smart Clean (Unobstruct Logic)
     const handleLocalDedupe = async () => {
-        if (!confirm('Run Smart Unobstruct & Clean? This will remove duplicates and try to keep only the clearest board views.')) return;
+        if (!confirm('Run Smart Clean? This will remove duplicates and obstructed views.')) return;
         setLoading(true);
 
         const getHammingDistance = (h1, h2) => {
-            if (!h1 || !h2 || h1.length !== h2.length) return 100;
+            if (!h1 || !h2) return 100;
             let dist = 0;
-            for (let i = 0; i < h1.length; i++) if (h1[i] !== h2[i]) dist++;
+            for (let i = 0; i < 64; i++) if (h1[i] !== h2[i]) dist++;
             return dist;
         };
 
         setScannedImages(prev => {
             if (prev.length === 0) return prev;
-
             const sorted = [...prev].sort((a, b) => a.ts - b.ts);
             const unique = [];
-
             if (sorted.length > 0) unique.push(sorted[0]);
-
             let lastKept = sorted[0];
-            let removedCount = 0;
 
             for (let i = 1; i < sorted.length; i++) {
                 const current = sorted[i];
                 const dist = getHammingDistance(lastKept.phash, current.phash);
                 const timeDiff = current.ts - lastKept.ts;
 
-                // LOGIC:
-                // 1. IS DUPLICATE? (Hamming Dist < 12)
                 if (dist <= 12) {
-                    // SMART UNOBSTRUCT:
-                    // If duplicate, pick the "cleaner" image (smaller file size usually means fewer people/objects)
-                    // Compare file sizes (base64 length).
+                    // Smart Unobstruct: Keep smaller file (cleaner view)
                     if (current.url.length < lastKept.url.length) {
-                        // Current is cleaner! Swap it.
                         unique.pop();
                         unique.push(current);
-                        lastKept = current; // Update reference
-                        console.log(`Smart Unobstruct: Swapped for cleaner view at ${current.ts}s`);
-                    } else {
-                        // Last kept was cleaner. Ignore current.
-                        console.log(`Smart Unobstruct: Ignored obstructed view at ${current.ts}s`);
+                        lastKept = current;
                     }
-                    removedCount++;
-                }
-                // 2. BURST FILTER (Time < 1s)
-                else if (timeDiff < 1) {
-                    removedCount++;
-                }
-                // 3. NEW UNIQUE SLIDE
-                else {
+                } else if (timeDiff < 1) {
+                    // Burst ignore
+                } else {
                     unique.push(current);
                     lastKept = current;
                 }
             }
-            console.log(`AI Clean: Optimized ${removedCount} slides.`);
             return unique;
         });
-
         setLoading(false);
     };
 
-    // Remove specific image
-    const handleRemoveImage = (indexToRemove) => {
-        setScannedImages(prev => prev.filter((_, idx) => idx !== indexToRemove));
+    const handleRemoveImage = (idToRemove) => {
+        setScannedImages(prev => prev.filter(img => img.id !== idToRemove));
     };
 
-    // Save to Cloud
+    // Save to Cloud (Uses merged /upload endpoint)
     const handleSaveToCloud = async () => {
         if (scannedImages.length === 0) return;
-        if (!confirm(`Upload ${scannedImages.length} images to Cloud Gallery?`)) return;
+        if (!confirm(`Save ${scannedImages.length} slides to cloud?`)) return;
 
         setLoading(true);
         try {
-            const { uploadToR2 } = await import("../lib/r2");
-            const { addDoc, collection, serverTimestamp } = await import("firebase/firestore");
-            const { db } = await import("../lib/firebase");
-
             let count = 0;
             for (const img of scannedImages) {
-                // Upload base64 to R2
-                const filename = `snaps/${Date.now()}_${Math.random().toString(36).substring(7)}.jpg`;
-                const publicUrl = await uploadToR2(img.url, filename);
+                // Determine filename
+                const fileName = `snaps/${Date.now()}_${img.id}.jpg`;
 
-                // Save to Firestore
+                // Upload to Backend (which proxies to R2)
+                const uploadRes = await fetch(`${BACKEND_URL}/upload`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ data: img.url, fileName })
+                });
+
+                if (!uploadRes.ok) throw new Error("Upload failed");
+                const { url: publicUrl } = await uploadRes.json();
+
+                // Save Metadata to Firestore
                 await addDoc(collection(db, 'snaps'), {
                     url,
                     imageUrl: publicUrl,
@@ -304,161 +266,98 @@ export default function CapturePage() {
                 });
                 count++;
             }
-            alert(`Saved ${count} slides to Cloud Gallery!`);
-            setScannedImages([]); // Clear local
+            alert(`Saved ${count} slides!`);
+            setScannedImages([]);
         } catch (e) {
-            console.error(e);
-            alert("Upload failed: " + e.message);
+            alert("Save failed: " + e.message);
         } finally {
             setLoading(false);
         }
     };
 
+    // PDF Export
     const handleDownloadPDF = async (layout) => {
         setIsPdfModalOpen(false);
         if (scannedImages.length === 0) return;
-
         setLoading(true);
         try {
+            // Dynamic import to prevent SSR issues
             const { jsPDF } = await import('jspdf');
             const doc = new jsPDF();
-
             const pageWidth = doc.internal.pageSize.getWidth();
             const pageHeight = doc.internal.pageSize.getHeight();
             const margin = 10;
-            const usableWidth = pageWidth - (margin * 2);
+            const usableWidth = pageWidth - (2 * margin);
 
-            // --- 1. PROMO PAGE (First Page) ---
-            doc.setFillColor(0, 0, 0); // Black Background
+            // Cover Page
+            doc.setFillColor(10, 10, 10);
             doc.rect(0, 0, pageWidth, pageHeight, 'F');
-
-            doc.setTextColor(255, 255, 255); // White Text
+            doc.setTextColor(255, 255, 255);
             doc.setFont("helvetica", "bold");
-            doc.setFontSize(40);
+            doc.setFontSize(32);
             doc.text("LECTURESNAP", pageWidth / 2, pageHeight / 3, { align: 'center' });
-
-            doc.setFontSize(16);
-            doc.setTextColor(250, 204, 21); // Yellow-400 equivalent
-            doc.text("Your AI-Powered Knowledge Capture Tool", pageWidth / 2, (pageHeight / 3) + 20, { align: 'center' });
-
-            doc.setFontSize(12);
-            doc.setTextColor(200, 200, 200);
-            doc.text("https://lecturesnap.online/", pageWidth / 2, (pageHeight / 3) + 40, { align: 'center' });
-
+            doc.setFontSize(14);
+            doc.setTextColor(250, 204, 21); // Yellow
+            doc.text("Your AI-Powered Knowledge Capture Tool", pageWidth / 2, pageHeight / 3 + 20, { align: 'center' });
+            doc.setTextColor(150, 150, 150);
             doc.setFontSize(10);
-            doc.setTextColor(100, 100, 100);
-            doc.text(`Generated on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}`, pageWidth / 2, pageHeight - 20, { align: 'center' });
+            doc.text("https://lecturesnap.online/", pageWidth / 2, pageHeight / 3 + 40, { align: 'center' });
 
-            // Start Content on Page 2
             doc.addPage();
-            doc.setFillColor(255, 255, 255); // Reset Fill
-            doc.rect(0, 0, pageWidth, pageHeight, 'F'); // Ensure white background
 
-            // --- 2. CONTENT PAGES ---
-            const sortedImages = [...scannedImages].sort((a, b) => a.ts - b.ts);
+            // Content
+            const sorted = [...scannedImages].sort((a, b) => a.ts - b.ts);
+            const imgHeight = usableWidth / (16 / 9);
 
-            // Layout Logic (Maintain 16:9 Aspect Ratio)
-            const imgRatio = 16 / 9;
-            const imgHeight = usableWidth / imgRatio;
-
-            for (let i = 0; i < sortedImages.length; i++) {
-                const img = sortedImages[i];
-
-                // Add Page Logic
-                // i=0 is on Page 2 (created above).
+            for (let i = 0; i < sorted.length; i++) {
+                const img = sorted[i];
                 if (i > 0) {
                     if (layout === 'single') doc.addPage();
                     else if (layout === 'double' && i % 2 === 0) doc.addPage();
                 }
 
-                // --- 3. WATERMARK (Per Page) ---
-                // Draw if this is the start of a "page unit"
-                const isNewPageContext = (layout === 'single') || (i === 0) || (layout === 'double' && i % 2 === 0);
-
-                if (isNewPageContext) {
-                    // Reset to white bg just in case
-                    // Draw Watermark
+                // Watermark per page context
+                const isNewContext = (layout === 'single' || i === 0 || (layout === 'double' && i % 2 === 0));
+                if (isNewContext) {
                     doc.saveGraphicsState();
-                    doc.setTextColor(240, 240, 240); // Very light gray (almost invisible)
-                    doc.setFontSize(50);
-                    doc.setFont("helvetica", "bold");
-                    // Diagonal Center Watermark (approx 45 deg)
-                    // jsPDF text rotation: doc.text(text, x, y, { angle: 45 })
+                    doc.setTextColor(245, 245, 245);
+                    doc.setFontSize(60);
                     doc.text("LectureSnap", pageWidth / 2, pageHeight / 2, { align: 'center', angle: 45 });
                     doc.restoreGraphicsState();
                 }
 
-                // --- IMAGE CONTENT ---
                 doc.setTextColor(0, 0, 0);
-                doc.setFont("courier", "normal");
-
-                // Y Position
-                let yPos = margin + 20;
-                if (layout === 'double' && i % 2 !== 0) {
-                    yPos = margin + 20 + imgHeight + 20;
-                }
-
-                // Header
+                doc.setFont("helvetica", "normal");
                 doc.setFontSize(10);
-                doc.text(`Slide ${i + 1} (${img.ts}s)`, margin, yPos - 5);
 
-                // Image
-                doc.addImage(img.url, 'JPEG', margin, yPos, usableWidth, imgHeight);
+                let y = margin + 20;
+                if (layout === 'double' && i % 2 !== 0) y = margin + 20 + imgHeight + 20;
 
-                // Notes (Single)
+                doc.text(`Slide ${i + 1} (${img.ts}s)`, margin, y - 5);
+                doc.addImage(img.url, 'JPEG', margin, y, usableWidth, imgHeight);
+
                 if (layout === 'single') {
-                    doc.setFontSize(12);
                     doc.setFont("helvetica", "bold");
-                    doc.text("Notes:", margin, yPos + imgHeight + 10);
-
-                    doc.setDrawColor(200, 200, 200);
-                    doc.line(margin, yPos + imgHeight + 20, pageWidth - margin, yPos + imgHeight + 20);
-                    doc.line(margin, yPos + imgHeight + 30, pageWidth - margin, yPos + imgHeight + 30);
-                    doc.line(margin, yPos + imgHeight + 40, pageWidth - margin, yPos + imgHeight + 40);
+                    doc.text("Notes:", margin, y + imgHeight + 15);
+                    doc.setDrawColor(220, 220, 220);
+                    doc.line(margin, y + imgHeight + 25, pageWidth - margin, y + imgHeight + 25);
+                    doc.line(margin, y + imgHeight + 35, pageWidth - margin, y + imgHeight + 35);
                 }
             }
-
-            doc.save(`LectureSnap_${Date.now()}.pdf`);
-
+            doc.save('LectureSnap_Notes.pdf');
         } catch (e) {
             console.error(e);
-            alert("PDF generation failed.");
+            alert("PDF Error: " + e.message);
         } finally {
             setLoading(false);
         }
     };
 
+    // --------------------------------------------------------------------------------
+    // RENDER
+    // --------------------------------------------------------------------------------
     return (
-        <div className="min-h-screen bg-[#f0f0f0] text-black font-mono flex flex-col items-center py-10 px-4">
-
-            {/* PERMISSION EXPLAINER MODAL (Simple Words) */}
-            {showPermissionModal && (
-                <div className="fixed inset-0 bg-black/80 z-[100] flex items-center justify-center p-4 backdrop-blur-sm animate-in fade-in duration-300">
-                    <div className="bg-white border-4 border-black shadow-[16px_16px_0px_0px_#FACC15] max-w-lg w-full p-8 relative">
-                        <h3 className="text-2xl font-black uppercase mb-4 flex items-center gap-2">
-                            🛡️ Security Alert?
-                        </h3>
-                        <p className="font-bold text-lg mb-4">
-                            Did you see a <span className="text-blue-600 bg-blue-100 px-1">"Network Access"</span> or Firewall popup?
-                        </p>
-                        <div className="bg-gray-100 p-4 border-l-4 border-black mb-6 text-sm space-y-2">
-                            <p><strong>Don't Worry! It's Safe.</strong></p>
-                            <p>This app runs a <span className="font-bold">smart video scanner</span> directly on your computer (not in the cloud) for maximum privacy and speed.</p>
-                            <p>Windows just wants to check if it's okay for the scanner to send screenshots to this window.</p>
-                        </div>
-                        <p className="font-bold mb-6 text-center">
-                            Please click <span className="bg-black text-white px-2 py-1 mx-1">Allow Access</span> if asked!
-                        </p>
-                        <button
-                            onClick={handleDismissPermissionMatches}
-                            className="w-full bg-[#FACC15] hover:bg-[#EAB308] text-black font-black text-xl py-4 border-4 border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] active:translate-y-1 active:shadow-none transition-all"
-                        >
-                            OK, I UNDERSTAND
-                        </button>
-                    </div>
-                </div>
-            )}
-
+        <div className="min-h-screen bg-gray-50 text-gray-900 font-sans selection:bg-yellow-200">
             <PdfExportOptionsModal
                 isOpen={isPdfModalOpen}
                 onClose={() => setIsPdfModalOpen(false)}
@@ -466,167 +365,206 @@ export default function CapturePage() {
                 action="download"
             />
 
-            {/* Header */}
-            <div className="w-full max-w-5xl flex justify-between items-center mb-12 border-b-4 border-black pb-6">
-                <Link to="/app" className="flex items-center gap-2 font-black text-xl hover:translate-x-1 transition-transform">
-                    <ArrowLeft className="w-6 h-6 border-2 border-black rounded-full p-0.5" /> BACK TO APP
+            {/* NAVBAR */}
+            <nav className="sticky top-0 z-50 bg-white/80 backdrop-blur-md border-b border-gray-200 px-6 py-4 flex items-center justify-between">
+                <Link to="/app" className="flex items-center gap-2 text-sm font-bold text-gray-600 hover:text-black transition-colors">
+                    <ArrowLeft className="w-4 h-4" /> Back
                 </Link>
-                <div className="flex gap-4 items-center">
-                    <button
-                        onClick={() => setShowPermissionModal(true)}
-                        className="text-xs font-bold underline text-gray-500 hover:text-black"
-                    >
-                        Why "Network Access"?
-                    </button>
-                    <h1 className="text-4xl font-black bg-black text-white px-4 py-1 skew-x-[-10deg]">
-                        LECTURE<span className="text-yellow-400">SNAP</span>
-                    </h1>
+                <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 bg-black text-white flex items-center justify-center font-black rounded-lg transform -skew-x-12">
+                        ls
+                    </div>
+                    <span className="font-bold text-xl tracking-tight">LectureSnap</span>
                 </div>
-            </div>
+                <div className="w-16"></div> {/* Spacer */}
+            </nav>
 
-            {/* Input Section */}
-            <div className="w-full max-w-3xl mb-16 relative">
-                <div className="bg-white border-4 border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] p-8 flex flex-col gap-6 relative z-10">
-                    <label className="font-black text-xl uppercase flex items-center gap-2">
-                        <LinkIcon className="w-6 h-6" /> YouTube URL
-                    </label>
-                    <div className="flex gap-0">
+            {/* HERO INPUT */}
+            <div className="max-w-4xl mx-auto pt-16 pb-12 px-4 text-center">
+                <h1 className="text-4xl md:text-5xl font-black mb-6 tracking-tight">
+                    Capture Knowledge.<br />
+                    <span className="text-transparent bg-clip-text bg-gradient-to-r from-yellow-500 to-orange-500">
+                        Faster than real-time.
+                    </span>
+                </h1>
+
+                <div className="relative group max-w-2xl mx-auto shadow-2xl shadow-yellow-500/20 rounded-2xl">
+                    <div className="absolute -inset-0.5 bg-gradient-to-r from-yellow-400 to-orange-500 rounded-2xl blur opacity-30 group-hover:opacity-60 transition duration-1000"></div>
+                    <div className="relative flex items-center bg-white rounded-2xl p-2">
+                        <LinkIcon className="w-5 h-5 text-gray-400 ml-4" />
                         <input
                             type="text"
+                            className="w-full bg-transparent p-4 text-lg font-medium outline-none placeholder:text-gray-400"
+                            placeholder="Paste YouTube Link..."
                             value={url}
                             onChange={(e) => setUrl(e.target.value)}
-                            placeholder="https://www.youtube.com/watch?v=..."
-                            className="flex-1 bg-gray-100 border-4 border-black p-4 font-bold text-lg focus:outline-none focus:bg-yellow-50 placeholder:text-gray-400"
-                            disabled={loading}
                         />
                         <button
                             onClick={handleScan}
                             disabled={loading}
-                            className={`px-8 font-black text-xl text-white border-y-4 border-r-4 border-black transition-all active:translate-y-1 active:shadow-none
-                            ${loading ? 'bg-gray-600 cursor-not-allowed' : 'bg-[#FF3333] hover:bg-[#ff0000]'}
+                            className={`px-8 py-3 rounded-xl font-bold text-white shadow-lg transition-all transform active:scale-95
+                                ${loading ? 'bg-gray-800 cursor-wait' : 'bg-black hover:bg-gray-900 hover:shadow-xl'}
                             `}
                         >
-                            {loading ? <Loader2 className="w-6 h-6 animate-spin" /> : 'SCAN VIDEO'}
+                            {loading ? <Loader className="w-5 h-5 animate-spin" /> : 'Scan'}
                         </button>
                     </div>
-
-                    {status === 'SCANNING' && (
-                        <div className="w-full">
-                            <div className="flex justify-between font-bold text-xs uppercase mb-1">
-                                <span>Progress</span>
-                                <span>{Math.round(scanProgress)}%</span>
-                            </div>
-                            <div className="w-full h-8 border-4 border-black bg-gray-200 relative">
-                                <div className="h-full bg-yellow-400 transition-all duration-300" style={{ width: `${scanProgress}%` }}></div>
-                                <div className="absolute inset-0 w-full h-full bg-[repeating-linear-gradient(45deg,transparent,transparent_10px,rgba(0,0,0,0.1)_10px,rgba(0,0,0,0.1)_20px)]"></div>
-                            </div>
-                            <div className="mt-2 font-mono text-sm font-bold text-center animate-pulse">{scanStatus}</div>
-                        </div>
-                    )}
-                    {error && <div className="bg-red-100 border-2 border-red-500 text-red-600 font-bold p-3 text-sm">ERROR: {error}</div>}
                 </div>
-                <div className="absolute top-4 left-4 w-full h-full border-4 border-black bg-yellow-400 z-0 content-['']"></div>
+
+                {/* PROGRESS BAR */}
+                {status === 'SCANNING' && (
+                    <div className="mt-8 max-w-lg mx-auto bg-white p-4 rounded-xl border border-gray-100 shadow-sm animate-in fade-in slide-in-from-bottom-4">
+                        <div className="flex justify-between text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                            <span>{scanStatus}</span>
+                            <span>{Math.round(scanProgress)}%</span>
+                        </div>
+                        <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                            <div
+                                className="h-full bg-gradient-to-r from-yellow-400 to-orange-500 transition-all duration-300 ease-out"
+                                style={{ width: `${scanProgress}%` }}
+                            ></div>
+                        </div>
+                    </div>
+                )}
+
+                {error && (
+                    <div className="mt-4 inline-flex items-center gap-2 text-red-600 bg-red-50 px-4 py-2 rounded-full text-sm font-medium">
+                        <X className="w-4 h-4" /> {error}
+                    </div>
+                )}
             </div>
 
-            {/* LIVE LOCAL SESSION */}
-            {scannedImages.length > 0 && (
-                <div className="w-full max-w-6xl mb-16 animate-in slide-in-from-bottom-5 fade-in duration-500">
-                    <div className="flex items-center justify-between mb-8 bg-black text-white p-4 border-4 border-yellow-400 shadow-[8px_8px_0px_0px_rgba(0,0,0,1)]">
-                        <div className="flex items-center gap-4">
-                            <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
-                            <h2 className="text-2xl font-black uppercase">Live Session ({scannedImages.length})</h2>
+            {/* MAIN CONTENT AREA */}
+            <div className="max-w-7xl mx-auto px-4 pb-32">
+
+                {/* LIVE SESSION HEADER */}
+                {scannedImages.length > 0 && (
+                    <div className="flex items-end justify-between mb-8 border-b border-gray-200 pb-4 animate-in fade-in duration-500">
+                        <div>
+                            <h2 className="text-2xl font-bold flex items-center gap-2">
+                                <span className="relative flex h-3 w-3">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                    <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                                </span>
+                                Live Session
+                                <span className="bg-gray-100 text-gray-600 text-xs px-2 py-1 rounded-full font-mono">
+                                    {scannedImages.length}
+                                </span>
+                            </h2>
                         </div>
-                        <div className="flex gap-4">
-                            <button onClick={handleLocalDedupe} className="bg-yellow-400 text-black px-4 py-2 font-black uppercase hover:bg-white transition-colors flex items-center gap-2">
-                                ✨ AI Clean
+
+                        <div className="flex gap-2">
+                            <button
+                                onClick={handleLocalDedupe}
+                                className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 rounded-lg text-sm font-medium hover:bg-yellow-50 hover:border-yellow-200 hover:text-yellow-700 transition-colors"
+                            >
+                                <Zap className="w-4 h-4" /> AI Clean
                             </button>
-                            <button onClick={() => setIsPdfModalOpen(true)} className="bg-white text-black px-4 py-2 font-black uppercase hover:bg-gray-200 transition-colors flex items-center gap-2">
+                            <button
+                                onClick={() => setIsPdfModalOpen(true)}
+                                className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 rounded-lg text-sm font-medium hover:bg-gray-50 transition-colors"
+                            >
                                 <FileText className="w-4 h-4" /> PDF
                             </button>
-                            <button onClick={handleSaveToCloud} className="bg-green-500 text-white px-4 py-2 font-black uppercase hover:bg-green-600 transition-colors flex items-center gap-2">
-                                <Save className="w-4 h-4" /> Save to Cloud
+                            <button
+                                onClick={handleSaveToCloud}
+                                className="flex items-center gap-2 px-4 py-2 bg-black text-white rounded-lg text-sm font-medium hover:bg-gray-800 shadow-md transition-all"
+                            >
+                                <Save className="w-4 h-4" /> Save Cloud
                             </button>
-                            <button onClick={() => setScannedImages([])} className="bg-red-500 text-white px-4 py-2 font-black uppercase hover:bg-red-600 transition-colors flex items-center gap-2">
-                                <Trash2 className="w-4 h-4" /> Clear Session
+                            <button
+                                onClick={() => setScannedImages([])}
+                                className="p-2 text-gray-400 hover:text-red-500 transition-colors"
+                                title="Clear Session"
+                            >
+                                <Trash2 className="w-5 h-5" />
                             </button>
                         </div>
                     </div>
+                )}
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8" ref={bottomRef}>
-                        {scannedImages.map((img, idx) => (
-                            <div key={idx} className="group relative bg-white border-4 border-black p-2 shadow-lg">
-                                <div className="relative aspect-video bg-gray-100 mb-2 border-2 border-black group-hover:border-yellow-400 transition-colors">
-                                    <img src={img.url} className="w-full h-full object-cover" />
-                                    <div className="absolute top-2 right-2 bg-black text-white font-bold px-2 text-xs">
-                                        {img.ts}s
+                {/* GRID */}
+                {scannedImages.length > 0 ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                        {scannedImages.map((img) => (
+                            <div key={img.id} className="group relative bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden hover:shadow-xl transition-all duration-300">
+                                <div className="aspect-video bg-gray-100 relative overflow-hidden">
+                                    <img src={img.url} className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105" alt="slide" />
+
+                                    {/* Overlay Info */}
+                                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/60 to-transparent p-3 translate-y-full group-hover:translate-y-0 transition-transform duration-300 flex justify-between items-end">
+                                        <span className="text-white text-xs font-mono font-medium">{img.ts}s</span>
                                     </div>
-                                    {/* DELETE BUTTON */}
+
+                                    {/* Delete Button */}
                                     <button
-                                        onClick={() => handleRemoveImage(idx)}
-                                        className="absolute -top-3 -right-3 bg-red-500 text-white w-8 h-8 flex items-center justify-center border-2 border-black opacity-0 group-hover:opacity-100 hover:scale-110 transition-all font-black z-20 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]"
+                                        onClick={() => handleRemoveImage(img.id)}
+                                        className="absolute top-2 right-2 p-1.5 bg-white/90 backdrop-blur rounded-full text-red-500 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-50"
                                     >
-                                        X
+                                        <X className="w-4 h-4" />
                                     </button>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                ) : (
+                    !loading && (
+                        <div className="text-center py-20 opacity-50">
+                            <LayoutGrid className="w-16 h-16 mx-auto mb-4 text-gray-300" />
+                            <p className="text-gray-400">Ready to capture.</p>
+                        </div>
+                    )
+                )}
+            </div>
+
+            {/* FLOATING STATUS BAR (Appears on Scroll) */}
+            {status === 'SCANNING' && showFloatingStatus && (
+                <div className="fixed bottom-6 left-1/2 -translate-x-1/2 w-[90%] max-w-2xl bg-white/90 backdrop-blur-md border border-gray-200 p-4 rounded-2xl shadow-2xl z-50 animate-in slide-in-from-bottom-10 fade-in duration-300 flex items-center gap-4">
+                    <div className="flex-1 min-w-0">
+                        <div className="flex justify-between text-xs font-bold text-gray-500 uppercase tracking-wider mb-1">
+                            <span className="truncate">{scanStatus}</span>
+                            <span>{Math.round(scanProgress)}%</span>
+                        </div>
+                        <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                            <div className="h-full bg-blue-500 transition-all duration-300" style={{ width: `${scanProgress}%` }}></div>
+                        </div>
+                    </div>
+                    <div className="w-px h-8 bg-gray-200"></div>
+                    <div className="flex items-center gap-3 shrink-0">
+                        <label className="flex items-center gap-2 cursor-pointer select-none group">
+                            <div className="relative">
+                                <input
+                                    type="checkbox"
+                                    checked={autoScrollEnabled}
+                                    onChange={(e) => setAutoScrollEnabled(e.target.checked)}
+                                    className="peer sr-only"
+                                />
+                                <div className={`w-10 h-6 bg-gray-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600`}></div>
+                            </div>
+                            <span className="font-bold text-xs text-gray-500 uppercase">Auto-Scroll</span>
+                        </label>
+                    </div>
+                </div>
+            )}
+
+            {/* SAVED SNAPS (BELOW) */}
+            {snaps.length > 0 && (
+                <div className="max-w-7xl mx-auto px-4 border-t border-gray-200 pt-16 mt-16">
+                    <h3 className="text-lg font-bold text-gray-400 uppercase tracking-widest mb-8 flex items-center gap-4">
+                        <CheckCircle className="w-5 h-5" /> Library Archive
+                    </h3>
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 opacity-70 hover:opacity-100 transition-opacity">
+                        {snaps.map((snap) => (
+                            <div key={snap.id} className="aspect-video bg-gray-200 rounded-lg overflow-hidden relative group">
+                                <img src={snap.imageUrl} className="w-full h-full object-cover grayscale group-hover:grayscale-0 transition-all" />
+                                <div className="absolute inset-0 bg-black/50 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <span className="text-white text-xs font-bold">{snap.title}</span>
                                 </div>
                             </div>
                         ))}
                     </div>
                 </div>
             )}
-
-            {/* SAVED SNAPS */}
-            <div className="w-full max-w-6xl opacity-70 hover:opacity-100 transition-opacity">
-                <div className="flex items-center gap-4 mb-8">
-                    <CheckCircle className="w-8 h-8 text-black" />
-                    <h2 className="text-3xl font-black uppercase">Saved Library</h2>
-                    <div className="h-1 bg-black flex-1"></div>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-                    {snaps.map((snap) => (
-                        <div key={snap.id} className="group relative bg-white border-4 border-gray-300 hover:border-black transition-all">
-                            <div className="aspect-video bg-gray-100 overflow-hidden">
-                                <img src={snap.imageUrl} className="w-full h-full object-cover grayscale group-hover:grayscale-0 transition-all" />
-                            </div>
-                            <div className="p-2 text-xs font-mono font-bold text-gray-500 group-hover:text-black">
-                                {snap.title}
-                            </div>
-                        </div>
-                    ))}
-                </div>
-            </div>
-
-            {/* FLOATING STATUS BAR */}
-            {status === 'SCANNING' && showFloatingStatus && (
-                <div className="fixed bottom-6 left-1/2 -translate-x-1/2 w-[90%] max-w-2xl bg-black text-yellow-400 border-4 border-yellow-400 p-4 shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] z-50 animate-in slide-in-from-bottom-10 fade-in duration-300">
-                    <div className="flex items-center justify-between gap-4">
-                        <div className="flex-1 min-w-0">
-                            <div className="flex justify-between text-xs font-black uppercase mb-1">
-                                <span className="truncate">{scanStatus}</span>
-                                <span>{Math.round(scanProgress)}%</span>
-                            </div>
-                            <div className="w-full h-2 bg-gray-800 rounded-full overflow-hidden">
-                                <div className="h-full bg-yellow-400 transition-all duration-300" style={{ width: `${scanProgress}%` }}></div>
-                            </div>
-                        </div>
-                        <div className="w-0.5 h-8 bg-yellow-400 opacity-30"></div>
-                        <div className="flex items-center gap-3 shrink-0">
-                            <label className="flex items-center gap-2 cursor-pointer select-none group">
-                                <div className="relative">
-                                    <input type="checkbox" checked={autoScrollEnabled} onChange={(e) => setAutoScrollEnabled(e.target.checked)} className="peer sr-only" />
-                                    <div className="w-6 h-6 border-2 border-yellow-400 bg-black peer-checked:bg-yellow-400 transition-colors"></div>
-                                    <svg className="w-4 h-4 text-black absolute top-1 left-1 opacity-0 peer-checked:opacity-100 pointer-events-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="4"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                </div>
-                                <span className="font-bold text-sm uppercase group-hover:text-white transition-colors">Auto-Scroll</span>
-                            </label>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            <style>{`
-                .animate-marquee { animation: marquee 10s linear infinite; }
-                @keyframes marquee { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
-            `}</style>
         </div>
     );
 }

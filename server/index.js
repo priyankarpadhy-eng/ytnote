@@ -1,274 +1,272 @@
-
 const express = require('express');
 const { chromium } = require('playwright');
 const sharp = require('sharp');
 const cors = require('cors');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-app.get('/', (req, res) => {
-    res.send('LectureSnap Capture Server is Running (Parallel Mode)');
-});
+app.use(express.json({ limit: '50mb' }));
 
 // ---------------------------------------------------------
-// PERCEPTUAL HASHING (dHash)
+// R2 STORAGE SETUP
+// ---------------------------------------------------------
+const r2 = new S3Client({
+    region: "auto",
+    endpoint: `https://${process.env.VITE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: {
+        accessKeyId: process.env.VITE_R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.VITE_R2_SECRET_ACCESS_KEY,
+    }
+});
+
+app.get('/', (req, res) => res.send('LectureSnap Neural Engine v2.0 (Stealth)'));
+
+// ---------------------------------------------------------
+// UTILS
 // ---------------------------------------------------------
 async function calculateDHash(buffer) {
     try {
-        const { data } = await sharp(buffer)
-            .resize(9, 8, { fit: 'fill' })
-            .grayscale()
-            .raw()
-            .toBuffer({ resolveWithObject: true });
-
+        const { data } = await sharp(buffer).resize(9, 8, { fit: 'fill' }).grayscale().raw().toBuffer({ resolveWithObject: true });
         let hash = '';
         for (let y = 0; y < 8; y++) {
             for (let x = 0; x < 8; x++) {
-                const idx = y * 9 + x;
-                hash += (data[idx] > data[idx + 1] ? '1' : '0');
+                hash += (data[y * 9 + x] > data[y * 9 + x + 1] ? '1' : '0');
             }
         }
         return hash;
-    } catch (e) {
-        console.error("Hash calculation failed:", e);
-        return '0'.repeat(64);
-    }
+    } catch { return '0'.repeat(64); }
 }
 
+const LAUNCH_ARGS = [
+    '--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled',
+    '--disable-infobars', '--window-position=0,0', '--ignore-certifcate-errors',
+    '--ignore-certifcate-errors-spki-list',
+    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+];
+
 // ---------------------------------------------------------
-// METADATA ENDPOINT (For Probe)
+// ENDPOINTS
 // ---------------------------------------------------------
 app.get('/meta', async (req, res) => {
     const url = req.query.url;
-    if (!url) return res.status(400).json({ error: 'No URL provided' });
+    if (!url) return res.status(400).json({ error: 'No URL' });
 
     let browser;
     try {
-        console.log(`[META] Probing: ${url}`);
-        browser = await chromium.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars', '--disable-gpu']
+        console.log(`[META] Connecting: ${url}`);
+        browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport: { width: 1280, height: 720 },
+            deviceScaleFactor: 1
         });
 
-        const page = await browser.newPage();
-        await page.route('**/*.{image,stylesheet,font}', route => route.abort());
+        // Block heavy resources for speed
+        await context.route('**/*.{png,jpg,jpeg,gif,webp,font,woff,woff2}', route => route.abort());
 
+        const page = await context.newPage();
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Quick duration check
-        await page.waitForTimeout(1500);
+        // Wait for player
+        await page.waitForSelector('#movie_player', { timeout: 15000 });
+
+        // Get Duration
         const duration = await page.evaluate(() => {
             const v = document.querySelector('video');
             return v ? v.duration : 0;
         });
 
-        if (!duration) throw new Error("No duration found");
-
-        // Calculate suggested interval
-        let interval = 5;
-        if (duration < 300) interval = 2;
-        else if (duration < 1200) interval = 5;
-        else if (duration < 3600) interval = 10;
-        else interval = 30;
-
-        await browser.close();
-        res.json({ duration, interval });
+        const interval = duration < 300 ? 2 : (duration < 900 ? 5 : (duration < 1800 ? 10 : 20));
+        res.json({ duration: duration || 0, interval });
 
     } catch (e) {
-        console.error("Meta Error:", e);
+        console.error(e);
+        res.status(500).json({ error: "Failed to probe video" });
+    } finally {
         if (browser) await browser.close();
-        res.status(500).json({ error: e.message });
     }
 });
 
-// ---------------------------------------------------------
-// SCANNING ENDPOINT (Range Aware)
-// ---------------------------------------------------------
 app.get('/scan', async (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
+    const { url: videoUrl, start, end } = req.query;
+    const startParam = parseFloat(start) || 0;
+    const endParam = parseFloat(end) || 0;
 
-    const url = req.query.url;
-    const startParam = parseFloat(req.query.start) || 0;
-    const endParam = parseFloat(req.query.end) || 0;
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+    });
 
-    if (!url || (!url.includes('youtube.com') && !url.includes('youtu.be'))) {
-        res.write(`data: ${JSON.stringify({ error: 'Invalid URL' })}\n\n`);
-        return res.end();
-    }
+    console.log(`[SCAN] Worker started: ${startParam}-${endParam}s`);
 
-    console.log(`[SCAN START] Range: ${startParam}-${endParam || 'END'} | URL: ${url}`);
     let browser;
-
     try {
-        browser = await chromium.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-infobars',
-                '--disable-gpu'
-            ]
-        });
-
+        browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport: { width: 1280, height: 720 },
-            isMobile: false, hasTouch: false, javascriptEnabled: true, locale: 'en-US', timezoneId: 'America/New_York'
+            locale: 'en-US',
+            timezoneId: 'America/New_York'
+        });
+
+        // BLOCK ADS & TRACKERS to avoid "Something went wrong" crashes
+        await context.route('**/*', route => {
+            const u = route.request().url();
+            if (u.includes('googleads') || u.includes('doubleclick') || u.includes('analytics')) return route.abort();
+            if (u.match(/\.(png|jpg|jpeg|gif|webp|font|woff|woff2)$/)) return route.abort();
+            route.continue();
         });
 
         const page = await context.newPage();
-        await page.route('**/*.{image,stylesheet,font}', route => route.continue());
 
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        // Init Stealth Scripts
+        await page.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        });
 
+        await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+        // 1. Wait for player
+        try {
+            await page.waitForSelector('.html5-video-player', { state: 'visible', timeout: 20000 });
+        } catch {
+            throw new Error("Video player not found (blocked?)");
+        }
+
+        // 2. Kill Overlays
         await page.addStyleTag({
             content: `
-                .ytp-chrome-bottom, .ytp-chrome-top, .ytp-watermark, .ytp-ce-element, 
-                .ytp-gradient-bottom, .ytp-gradient-top, .ytp-spinner, .ytp-ad-module, 
-                .branding-img, .ytp-pause-overlay, #masthead-container, #secondary, #below, #comments, #chat
-                { display: none !important; } 
-                ytd-player, #player-container, #movie_player, video {
-                    position: fixed !important; top: 0 !important; left: 0 !important;
-                    width: 100vw !important; height: 100vh !important; z-index: 9999 !important; background: black !important;
-                }
-            `
+            .ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top, .ytp-gradient-bottom,
+            .ytp-watermark, .ytp-ce-element, .ytp-bezel-text, .ytp-spinner, .ytp-ad-overlay-container 
+            { display: none !important; }
+        `});
+
+        // 3. Ensure Video Ready
+        await page.evaluate(() => {
+            const v = document.querySelector('video');
+            if (v) {
+                v.muted = true;
+                v.pause(); // We seek manually, no need to play
+            }
         });
 
-        try { await page.click('.ytp-play-button'); } catch (e) { }
-        await page.waitForTimeout(3000);
+        // 4. Calculate Steps
+        const duration = await page.evaluate(() => document.querySelector('video')?.duration || 0);
+        const actualEnd = (endParam > 0 && endParam < duration) ? endParam : duration;
 
-        const duration = await page.evaluate(() => {
-            const v = document.querySelector('video'); return v ? v.duration : 0;
-        });
-
-        if (!duration) throw new Error("Could not detect video duration.");
-
-        // Smart Interval
+        // Smart Interval based on total video length (not just chunk)
         let interval = 5;
         if (duration < 300) interval = 2;
-        else if (duration < 1200) interval = 5;
-        else if (duration < 3600) interval = 10;
-        else interval = 30;
+        else if (duration < 900) interval = 5;
+        else if (duration < 1800) interval = 10;
+        else if (duration < 3600) interval = 15;
+        else interval = 20;
 
-        res.write(`data: ${JSON.stringify({ type: 'meta', duration, interval })}\n\n`);
+        let currentTime = startParam > 0 ? startParam : interval;
+        const segmentDuration = actualEnd - startParam;
 
-        // Determine Loop bounds
-        // If startParam is provided, prefer it. If it is 0, start at interval (to avoid 0:00 black screen often)
-        let currentTime = startParam || interval;
-        if (startParam > 0) currentTime = startParam;
+        // Loop
+        let lastPhash = null;
 
-        const endTime = (endParam > 0 && endParam < duration) ? endParam : duration;
+        while (currentTime < actualEnd) {
+            if (res.writableEnded) break;
 
-        console.log(`Scanning from ${currentTime}s to ${endTime}s with interval ${interval}s`);
+            // SEEK SAFE
+            const seekSuccess = await page.evaluate(async (t) => {
+                const v = document.querySelector('video');
+                if (!v) return false;
 
-        let slideCount = 0;
-        let lastHash = null;
-
-        while (currentTime < endTime) {
-            try {
-                // Auto-Error Recovery
-                const isError = await page.evaluate(() => document.body.innerText.includes("Something went wrong"));
-                if (isError) {
-                    console.log("Error screen detected. Reloading...");
-                    await page.reload({ waitUntil: 'domcontentloaded' });
-                    await page.waitForTimeout(3000);
-                    await page.addStyleTag({ content: 'ytd-player,video{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;z-index:9999!important;background:black!important;} #masthead-container{display:none!important}' });
-                }
-
-                const seekResult = await page.evaluate(async (time) => {
-                    const video = document.querySelector('video');
-                    if (video) {
-                        return new Promise((resolve) => {
-                            const timeout = setTimeout(() => resolve('timeout'), 5000);
-                            const onSeeked = () => { clearTimeout(timeout); video.removeEventListener('seeked', onSeeked); resolve('seeked'); };
-                            video.addEventListener('seeked', onSeeked);
-                            video.currentTime = time;
-                        });
-                    }
-                    return 'no-video';
-                }, currentTime);
-
-                if (seekResult === 'no-video') throw new Error('Video element missing');
-
-                await page.waitForTimeout(800); // 800ms Buffer wait
-
-                // Spinner Check
-                await page.evaluate(async () => {
-                    const s = document.querySelector('.ytp-spinner');
-                    if (s && getComputedStyle(s).display !== 'none') await new Promise(r => setTimeout(r, 1000));
+                return new Promise(resolve => {
+                    let done = false;
+                    const onSeek = () => {
+                        if (!done) { done = true; v.removeEventListener('seeked', onSeek); resolve(true); }
+                    };
+                    v.addEventListener('seeked', onSeek);
+                    v.currentTime = t;
+                    // Fallback if event doesn't fire
+                    setTimeout(() => { if (!done) { done = true; resolve(false); } }, 2000);
                 });
+            }, currentTime);
 
-                const buffer = await page.screenshot();
-                const pHash = await calculateDHash(buffer);
+            // Wait a tiny bit for render buffer to clear artifacts
+            if (seekSuccess) await page.waitForTimeout(300);
+            else await page.waitForTimeout(1000); // Wait longer if seek didn't ack
 
-                let hamming = 0;
-                if (lastHash) for (let i = 0; i < 64; i++) if (pHash[i] !== lastHash[i]) hamming++; else hamming = 100;
-
-                const segmentDuration = endTime - (startParam || 0);
-                const segmentProgress = ((currentTime - (startParam || 0)) / segmentDuration) * 100;
-
-                if (slideCount === 0 || hamming > 0) {
-                    slideCount++;
-                    const processedBuffer = await sharp(buffer)
-                        .resize({ width: 1280 })
-                        .composite([{ input: Buffer.from(`<svg width="1280" height="720"><text x="1100" y="700" fill="rgba(255,255,255,0.5)" font-size="24" font-weight="bold" font-family="sans-serif">LectureSnap</text></svg>`), gravity: 'southeast' }])
-                        .jpeg({ quality: 80 }).toBuffer();
-
-                    res.write(`data: ${JSON.stringify({
-                        type: 'image',
-                        imageUrl: `data:image/jpeg;base64,${processedBuffer.toString('base64')}`,
-                        timestamp: currentTime,
-                        progress: Math.round(segmentProgress),
-                        phash: pHash
-                    })}\n\n`);
-                    lastHash = pHash;
-                } else {
-                    res.write(`data: ${JSON.stringify({ type: 'progress', timestamp: currentTime, progress: Math.round(segmentProgress) })}\n\n`);
-                }
-
-            } catch (frameError) {
-                console.error(`Frame Error at ${currentTime}s:`, frameError.message);
+            // ERROR CHECK: "Something went wrong"
+            const isError = await page.$eval('.ytp-error-content', el => el && el.offsetParent !== null).catch(() => false);
+            if (isError) {
+                console.log("Player crashed, retrying page...");
+                await page.reload({ waitUntil: 'domcontentloaded' });
+                // Reset styling
+                await page.addStyleTag({ content: `.ytp-chrome-bottom { display: none !important; }` });
+                continue; // Retry same timestamp
             }
+
+            // SCREENSHOT (Element Handle Only)
+            const videoElement = await page.$('.html5-video-player'); // Container is safer than just video tag sometimes
+            let buffer;
+            if (videoElement) {
+                // screenshot element
+                buffer = await videoElement.screenshot({ type: 'jpeg', quality: 80 });
+            } else {
+                // extreme fallback
+                buffer = await page.screenshot({ type: 'jpeg', quality: 80 });
+            }
+
+            // DEDUPE
+            const currentPhash = await calculateDHash(buffer);
+            const getHammingDistance = (h1, h2) => {
+                let dist = 0;
+                for (let i = 0; i < 64; i++) if (h1[i] !== h2[i]) dist++;
+                return dist;
+            };
+
+            const isDuplicate = lastPhash && getHammingDistance(lastPhash, currentPhash) < 8; // Stricter backend check
+
+            // SEND
+            const progress = Math.min(100, Math.round(((currentTime - startParam) / segmentDuration) * 100));
+
+            if (!isDuplicate) {
+                lastPhash = currentPhash;
+                const base64 = buffer.toString('base64');
+                res.write(`data: ${JSON.stringify({
+                    type: 'image',
+                    imageUrl: `data:image/jpeg;base64,${base64}`,
+                    timestamp: Math.round(currentTime),
+                    phash: currentPhash,
+                    progress
+                })}\n\n`);
+            } else {
+                res.write(`data: ${JSON.stringify({ type: 'progress', progress })}\n\n`);
+            }
+
             currentTime += interval;
         }
 
-        res.write(`data: ${JSON.stringify({ type: 'done', totalSlides: slideCount })}\n\n`);
-        res.end();
-        await browser.close();
+        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
 
-    } catch (err) {
-        console.error("Scan Error:", err);
+    } catch (error) {
+        console.error(`[SCAN ERROR] ${error.message}`);
+        res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+    } finally {
         if (browser) await browser.close();
-        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
         res.end();
     }
 });
 
-app.post('/capture', async (req, res) => {
+app.post('/upload', async (req, res) => {
+    // ... (Use previous logic if needed, or keeping it concise) ...
     try {
-        const { url } = req.body;
-        if (!url) return res.status(400).json({ error: 'No URL' });
-        const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-        const page = await browser.newPage();
-        await page.setViewportSize({ width: 1280, height: 720 });
-        await page.goto(url, { waitUntil: 'domcontentloaded' });
-        await page.addStyleTag({ content: 'ytd-player,video{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;z-index:9999!important;background:black!important;} #masthead-container{display:none!important}' });
-
-        await page.evaluate(() => { const v = document.querySelector('video'); if (v) { v.currentTime = 10; v.play(); } });
-        await page.waitForTimeout(1000);
-        const buffer = await page.screenshot();
-        const processedBuffer = await sharp(buffer).resize({ width: 1280 }).jpeg({ quality: 80 }).toBuffer();
-        await browser.close();
-        return res.json({ success: true, imageUrl: `data:image/jpeg;base64,${processedBuffer.toString('base64')}` });
-    } catch (e) { return res.status(500).json({ error: e.message }); }
+        const { data, fileName } = req.body;
+        const base64Data = data.split(',')[1];
+        const buffer = Buffer.from(base64Data, 'base64');
+        await r2.send(new PutObjectCommand({ Bucket: process.env.VITE_R2_BUCKET_NAME, Key: fileName, Body: buffer, ContentType: 'image/jpeg' }));
+        res.json({ url: `${process.env.VITE_R2_PUBLIC_URL}/${fileName}` });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Stealth Engine running on ${PORT}`));

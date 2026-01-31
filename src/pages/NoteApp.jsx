@@ -30,7 +30,7 @@ import { PdfExportOptionsModal } from '../components/PdfExportOptionsModal';
 import { useTheme } from '../contexts/ThemeContext';
 import { db } from '../lib/firebase';
 import { collection, addDoc, serverTimestamp, doc, onSnapshot, setDoc, updateDoc, getDoc } from 'firebase/firestore';
-import { consumeCredit, rewardUserCredits, CREDIT_COSTS } from '../lib/credit-manager';
+import { consumeUserCredits, rewardUserCredits, CREDIT_COSTS } from '../lib/credit-manager';
 
 function NoteAppContent() {
     // 1. ALL HOOKS AT THE TOP
