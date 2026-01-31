@@ -6,7 +6,23 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
 
 const app = express();
-app.use(cors({ origin: '*' }));
+
+// 1. STRICT CORS POLICY
+app.use(cors({
+    origin: '*', // Allow all for development/debugging
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Manual Header Fallback for 502/Proxy bypass
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
+
 app.use(express.json({ limit: '50mb' }));
 
 // ---------------------------------------------------------
@@ -21,7 +37,49 @@ const r2 = new S3Client({
     }
 });
 
-app.get('/', (req, res) => res.send('LectureSnap Neural Engine v2.0 (Stealth)'));
+app.get('/', (req, res) => res.send('LectureSnap Neural Engine v2.1 (Ultra Stealth)'));
+app.get('/health', (req, res) => res.json({ status: 'ok', memory: process.memoryUsage() }));
+
+// ---------------------------------------------------------
+// BROWSER SINGLETON (REDUCE RAM USAGE)
+// ---------------------------------------------------------
+let sharedBrowser = null;
+let browserLaunchPromise = null;
+
+const LAUNCH_ARGS = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote',
+    '--single-process',
+    '--disable-gpu',
+    '--disable-blink-features=AutomationControlled',
+    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+];
+
+async function getBrowser() {
+    if (sharedBrowser) return sharedBrowser;
+    if (browserLaunchPromise) return browserLaunchPromise;
+
+    console.log("[SERVER] Launching fresh browser instance...");
+    browserLaunchPromise = chromium.launch({ headless: true, args: LAUNCH_ARGS }).then(b => {
+        sharedBrowser = b;
+        browserLaunchPromise = null;
+        b.on('disconnected', () => {
+            console.log("[SERVER] Browser disconnected, clearing cache.");
+            sharedBrowser = null;
+        });
+        return b;
+    }).catch(err => {
+        console.error("[SERVER] Browser launch FAILED:", err);
+        browserLaunchPromise = null;
+        throw err;
+    });
+
+    return browserLaunchPromise;
+}
 
 // ---------------------------------------------------------
 // UTILS
@@ -39,23 +97,6 @@ async function calculateDHash(buffer) {
     } catch { return '0'.repeat(64); }
 }
 
-const LAUNCH_ARGS = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
-    '--single-process', // This helps in low-RAM environments
-    '--disable-gpu',
-    '--disable-blink-features=AutomationControlled',
-    '--disable-infobars',
-    '--window-position=0,0',
-    '--ignore-certifcate-errors',
-    '--ignore-certifcate-errors-spki-list',
-    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-];
-
 // ---------------------------------------------------------
 // ENDPOINTS
 // ---------------------------------------------------------
@@ -63,39 +104,37 @@ app.get('/meta', async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: 'No URL' });
 
-    let browser;
+    let context;
     try {
-        console.log(`[META] Connecting: ${url}`);
-        browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
-        const context = await browser.newContext({
+        console.log(`[META] Probing: ${url}`);
+        const browser = await getBrowser();
+        context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 720 },
-            deviceScaleFactor: 1
+            viewport: { width: 1280, height: 720 }
         });
-
-        // Block heavy resources for speed
-        await context.route('**/*.{png,jpg,jpeg,gif,webp,font,woff,woff2}', route => route.abort());
 
         const page = await context.newPage();
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Wait for player
-        await page.waitForSelector('#movie_player', { timeout: 15000 });
-
-        // Get Duration
-        const duration = await page.evaluate(() => {
-            const v = document.querySelector('video');
-            return v ? v.duration : 0;
+        // Speed hack: block everything but HTML
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['document', 'script', 'xhr', 'fetch'].includes(type)) return route.continue();
+            return route.abort();
         });
 
-        const interval = duration < 300 ? 2 : (duration < 900 ? 5 : (duration < 1800 ? 10 : 20));
-        res.json({ duration: duration || 0, interval });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForSelector('video', { timeout: 15000 });
+
+        const duration = await page.evaluate(() => document.querySelector('video')?.duration || 0);
+        const interval = duration < 300 ? 5 : (duration < 900 ? 10 : 20);
+
+        res.json({ duration, interval });
 
     } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: "Failed to probe video" });
+        console.error("[META ERROR]", e.message);
+        res.status(500).json({ error: e.message });
     } finally {
-        if (browser) await browser.close();
+        if (context) await context.close();
     }
 });
 
@@ -108,145 +147,62 @@ app.get('/scan', async (req, res) => {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
     });
 
-    console.log(`[SCAN] Worker started: ${startParam}-${endParam}s`);
-
-    let browser;
+    let context;
     try {
-        browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 720 },
-            locale: 'en-US',
-            timezoneId: 'America/New_York'
-        });
+        const browser = await getBrowser();
+        context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+        const page = await context.newPage();
 
-        // BLOCK ADS & TRACKERS to avoid "Something went wrong" crashes
         await context.route('**/*', route => {
             const u = route.request().url();
-            if (u.includes('googleads') || u.includes('doubleclick') || u.includes('analytics')) return route.abort();
-            if (u.match(/\.(png|jpg|jpeg|gif|webp|font|woff|woff2)$/)) return route.abort();
+            if (u.includes('googleads') || u.includes('analytics')) return route.abort();
             route.continue();
         });
 
-        const page = await context.newPage();
-
-        // Init Stealth Scripts
-        await page.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        });
-
         await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForSelector('.html5-video-player', { timeout: 20000 });
 
-        // 1. Wait for player
-        try {
-            await page.waitForSelector('.html5-video-player', { state: 'visible', timeout: 20000 });
-        } catch {
-            throw new Error("Video player not found (blocked?)");
-        }
-
-        // 2. Kill Overlays
+        // Kill overlays
         await page.addStyleTag({
             content: `
             .ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top, .ytp-gradient-bottom,
-            .ytp-watermark, .ytp-ce-element, .ytp-bezel-text, .ytp-spinner, .ytp-ad-overlay-container 
-            { display: none !important; }
+            .ytp-watermark, .ytp-ce-element { display: none !important; }
         `});
 
-        // 3. Ensure Video Ready
-        await page.evaluate(() => {
-            const v = document.querySelector('video');
-            if (v) {
-                v.muted = true;
-                v.pause(); // We seek manually, no need to play
-            }
-        });
-
-        // 4. Calculate Steps
         const duration = await page.evaluate(() => document.querySelector('video')?.duration || 0);
         const actualEnd = (endParam > 0 && endParam < duration) ? endParam : duration;
-
-        // Smart Interval based on total video length (not just chunk)
-        let interval = 5;
-        if (duration < 300) interval = 2;
-        else if (duration < 900) interval = 5;
-        else if (duration < 1800) interval = 10;
-        else if (duration < 3600) interval = 15;
-        else interval = 20;
+        const interval = duration < 1200 ? 10 : 20;
 
         let currentTime = startParam > 0 ? startParam : interval;
-        const segmentDuration = actualEnd - startParam;
-
-        // Loop
         let lastPhash = null;
 
         while (currentTime < actualEnd) {
             if (res.writableEnded) break;
 
-            // SEEK SAFE
-            const seekSuccess = await page.evaluate(async (t) => {
+            await page.evaluate((t) => {
                 const v = document.querySelector('video');
-                if (!v) return false;
-
-                return new Promise(resolve => {
-                    let done = false;
-                    const onSeek = () => {
-                        if (!done) { done = true; v.removeEventListener('seeked', onSeek); resolve(true); }
-                    };
-                    v.addEventListener('seeked', onSeek);
-                    v.currentTime = t;
-                    // Fallback if event doesn't fire
-                    setTimeout(() => { if (!done) { done = true; resolve(false); } }, 2000);
-                });
+                if (v) v.currentTime = t;
             }, currentTime);
 
-            // Wait a tiny bit for render buffer to clear artifacts
-            if (seekSuccess) await page.waitForTimeout(300);
-            else await page.waitForTimeout(1000); // Wait longer if seek didn't ack
+            await page.waitForTimeout(500); // Wait for seek render
 
-            // ERROR CHECK: "Something went wrong"
-            const isError = await page.$eval('.ytp-error-content', el => el && el.offsetParent !== null).catch(() => false);
-            if (isError) {
-                console.log("Player crashed, retrying page...");
-                await page.reload({ waitUntil: 'domcontentloaded' });
-                // Reset styling
-                await page.addStyleTag({ content: `.ytp-chrome-bottom { display: none !important; }` });
-                continue; // Retry same timestamp
-            }
+            const videoElement = await page.$('.html5-video-player');
+            const buffer = await videoElement.screenshot({ type: 'jpeg', quality: 70 });
 
-            // SCREENSHOT (Element Handle Only)
-            const videoElement = await page.$('.html5-video-player'); // Container is safer than just video tag sometimes
-            let buffer;
-            if (videoElement) {
-                // screenshot element
-                buffer = await videoElement.screenshot({ type: 'jpeg', quality: 80 });
-            } else {
-                // extreme fallback
-                buffer = await page.screenshot({ type: 'jpeg', quality: 80 });
-            }
-
-            // DEDUPE
             const currentPhash = await calculateDHash(buffer);
-            const getHammingDistance = (h1, h2) => {
-                let dist = 0;
-                for (let i = 0; i < 64; i++) if (h1[i] !== h2[i]) dist++;
-                return dist;
-            };
+            const isDuplicate = lastPhash && currentPhash === lastPhash; // Simple check for speed
 
-            const isDuplicate = lastPhash && getHammingDistance(lastPhash, currentPhash) < 8; // Stricter backend check
-
-            // SEND
-            const progress = Math.min(100, Math.round(((currentTime - startParam) / segmentDuration) * 100));
+            const progress = Math.min(100, Math.round(((currentTime - startParam) / (actualEnd - startParam)) * 100));
 
             if (!isDuplicate) {
                 lastPhash = currentPhash;
-                const base64 = buffer.toString('base64');
                 res.write(`data: ${JSON.stringify({
                     type: 'image',
-                    imageUrl: `data:image/jpeg;base64,${base64}`,
+                    imageUrl: `data:image/jpeg;base64,${buffer.toString('base64')}`,
                     timestamp: Math.round(currentTime),
-                    phash: currentPhash,
                     progress
                 })}\n\n`);
             } else {
@@ -258,17 +214,16 @@ app.get('/scan', async (req, res) => {
 
         res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
 
-    } catch (error) {
-        console.error(`[SCAN ERROR] ${error.message}`);
-        res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+    } catch (e) {
+        console.error("[SCAN ERROR]", e.message);
+        res.write(`data: ${JSON.stringify({ type: 'error', error: e.message })}\n\n`);
     } finally {
-        if (browser) await browser.close();
+        if (context) await context.close();
         res.end();
     }
 });
 
 app.post('/upload', async (req, res) => {
-    // ... (Use previous logic if needed, or keeping it concise) ...
     try {
         const { data, fileName } = req.body;
         const base64Data = data.split(',')[1];
@@ -279,4 +234,7 @@ app.post('/upload', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Stealth Engine running on ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 LectureSnap Ultra Stealth Engine running on ${PORT}`);
+    console.log(`📡 Health check: http://localhost:${PORT}/health`);
+});
