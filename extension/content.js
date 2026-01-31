@@ -21,68 +21,83 @@ function captureVideoFrame() {
     }
 }
 
-// Function to handle the capture command (e.g. from keyboard shortcut or other content scripts)
-// For this demo, let's assume we capture when we receive a specific "CAPTURE_NOW" message 
-// OR simpler: we expose a listener. 
-// BUT the user requirement implies "When a capture happens". 
-// Let's add a keyboard listener for 'S' or distinct key as a trigger, 
-// OR expose the function for the sidepanel to call.
-// Given "LectureSnap" context, likely a keypress.
+// Shortcut: Shift + S to capture
 document.addEventListener('keydown', (e) => {
-    // Ignore if user is typing in a comment or search box
-    if (e.target.matches('input, textarea, [contenteditable]')) {
-        return;
-    }
-
-    // Shortcut: Shift + S to capture
+    if (e.target.matches('input, textarea, [contenteditable]')) return;
     if (e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 's' || e.key === 'S')) {
-        e.preventDefault(); // Prevent typing 'S' if applicable
-        e.stopPropagation(); // Stop YouTube from handling it
-        console.log("LectureSnap: Shift+S pressed (YouTube)");
-
+        e.preventDefault();
+        e.stopPropagation();
         const imageData = captureVideoFrame();
         if (imageData) {
-            const timestamp = document.querySelector('video')?.currentTime || 0;
-            // Send to Extension Runtime (Background)
             chrome.runtime.sendMessage({
                 action: "capture_taken",
                 data: imageData,
-                timestamp: timestamp,
+                timestamp: document.querySelector('video')?.currentTime || 0,
                 source: "youtube_tab"
             });
-            console.log("LectureSnap: Capture sent!");
         }
     }
-}, true); // <--- TRUE: Use Capture Phase to intercept before YouTube
+}, true);
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === "get_video_rect") {
-        // Reuse original logic if needed, but for now capture is priority
+// ---------------------------------------------------------
+// WEBSITE <-> EXTENSION BRIDGE
+// ---------------------------------------------------------
+
+window.addEventListener("message", (event) => {
+    const allowedOrigins = ['https://lecturesnap.online', 'http://localhost:5173'];
+    if (!allowedOrigins.includes(event.origin)) return;
+
+    if (event.data.type === "LECTURESNAP_PING") {
+        window.postMessage({ type: "LECTURESNAP_PONG" }, "*");
+    }
+
+    if (event.data.type === "LECTURESNAP_CAPTURE_REQUEST") {
+        const video = document.querySelector('video');
+        if (!video) {
+            window.postMessage({ type: "LECTURESNAP_CAPTURE_ERROR", message: "No video found" }, "*");
+            return;
+        }
+
+        const data = captureVideoFrame();
+        window.postMessage({
+            type: "LECTURESNAP_CAPTURE_RESPONSE",
+            data: data,
+            timestamp: video.currentTime,
+            duration: video.duration
+        }, "*");
+    }
+
+    if (event.data.type === "LECTURESNAP_SEEK_REQUEST") {
         const video = document.querySelector('video');
         if (video) {
-            sendResponse({
-                currentTime: video.currentTime,
-                duration: video.duration
-            });
+            video.currentTime = event.data.timestamp;
+            // Wait for seeked event once
+            const onSeeked = () => {
+                video.removeEventListener('seeked', onSeeked);
+                window.postMessage({ type: "LECTURESNAP_SEEK_DONE", timestamp: video.currentTime }, "*");
+            };
+            video.addEventListener('seeked', onSeeked);
         }
     }
-    // Also support external trigger (from Background Command)
+});
+
+// Extension-Specific Listeners
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === "get_video_rect") {
+        const video = document.querySelector('video');
+        if (video) sendResponse({ currentTime: video.currentTime, duration: video.duration });
+    }
     if (request.action === "trigger_capture") {
-        console.log("LectureSnap: Received trigger_capture command");
         const imageData = captureVideoFrame();
         if (imageData) {
-            const timestamp = document.querySelector('video')?.currentTime || 0;
-            // Send back to Background so it can broadcast to sidepanel & website
             chrome.runtime.sendMessage({
                 action: "capture_taken",
                 data: imageData,
-                timestamp: timestamp,
+                timestamp: document.querySelector('video')?.currentTime || 0,
                 source: "youtube_tab"
             });
-            console.log("LectureSnap: Command Capture sent!");
             sendResponse({ status: "success" });
         } else {
-            console.warn("LectureSnap: Capture failed (no image data)");
             sendResponse({ status: "failed" });
         }
     }

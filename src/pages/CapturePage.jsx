@@ -28,12 +28,30 @@ export default function CapturePage() {
     const [autoScrollEnabled, setAutoScrollEnabled] = useState(true);
     const [isPdfModalOpen, setIsPdfModalOpen] = useState(false);
     const [showFloatingStatus, setShowFloatingStatus] = useState(false);
+    const [hasExtension, setHasExtension] = useState(false);
+    const [scanMethod, setScanMethod] = useState('cloud'); // cloud or extension
 
     const bottomRef = useRef(null);
     const autoScrollRef = useRef(true);
 
     // Sync Ref
     useEffect(() => { autoScrollRef.current = autoScrollEnabled; }, [autoScrollEnabled]);
+
+    // Extension Check
+    useEffect(() => {
+        const checkExtension = () => {
+            window.postMessage({ type: "LECTURESNAP_PING" }, "*");
+        };
+        const handleMessage = (event) => {
+            if (event.data.type === "LECTURESNAP_PONG") {
+                setHasExtension(true);
+                setScanMethod('extension'); // Prefer extension if found
+            }
+        };
+        window.addEventListener('message', handleMessage);
+        checkExtension();
+        return () => window.removeEventListener('message', handleMessage);
+    }, []);
 
     // Scroll Listener for Floating Status
     useEffect(() => {
@@ -55,7 +73,84 @@ export default function CapturePage() {
     }, []);
 
     // --------------------------------------------------------------------------------
-    // CORE LOGIC (PARALLEL SCANNER)
+    // DEEP SCAN LOGIC (EXTENSION BASED)
+    // --------------------------------------------------------------------------------
+    const handleExtensionScan = async () => {
+        setLoading(true);
+        setStatus('SCANNING');
+        setError(null);
+        setScannedImages([]);
+        setScanProgress(0);
+        setScanStatus("Initializing Local Engine...");
+
+        const waitForMessage = (type) => new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                window.removeEventListener('message', handler);
+                reject(new Error(`Timeout waiting for ${type}`));
+            }, 10000);
+
+            const handler = (event) => {
+                if (event.data.type === type) {
+                    clearTimeout(timer);
+                    window.removeEventListener('message', handler);
+                    resolve(event.data);
+                }
+            };
+            window.addEventListener('message', handler);
+        });
+
+        try {
+            // STEP 1: INITIAL PROBE
+            window.postMessage({ type: "LECTURESNAP_CAPTURE_REQUEST" }, "*");
+            const initial = await waitForMessage("LECTURESNAP_CAPTURE_RESPONSE");
+            const duration = initial.duration;
+            const interval = duration > 1200 ? 20 : 10;
+
+            setScanStatus(`Acquired video (${Math.floor(duration)}s). Starting deep scan...`);
+
+            let currentTime = interval;
+            while (currentTime < duration) {
+                // Seek
+                window.postMessage({ type: "LECTURESNAP_SEEK_REQUEST", timestamp: currentTime }, "*");
+                await waitForMessage("LECTURESNAP_SEEK_DONE");
+
+                // Capture
+                window.postMessage({ type: "LECTURESNAP_CAPTURE_REQUEST" }, "*");
+                const response = await waitForMessage("LECTURESNAP_CAPTURE_RESPONSE");
+
+                setScannedImages(prev => {
+                    const newImg = {
+                        url: response.data,
+                        ts: Math.round(currentTime),
+                        id: Math.random().toString(36).substr(2, 9)
+                    };
+                    return [...prev, newImg];
+                });
+
+                const progress = Math.min(100, Math.round((currentTime / duration) * 100));
+                setScanProgress(progress);
+                setScanStatus(`Scanning... ${progress}%`);
+
+                currentTime += interval;
+
+                // Smart auto-scroll
+                if (autoScrollRef.current) {
+                    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+                }
+            }
+
+            setScanStatus("Deep Scan Completed");
+            setStatus('DONE');
+        } catch (e) {
+            setError(`Extension Error: ${e.message}. Please ensure the YouTube video is open in another tab.`);
+            setStatus('ERROR');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    // --------------------------------------------------------------------------------
+    // CLOUD SCAN LOGIC (BACKUP)
     // --------------------------------------------------------------------------------
     const handleScan = async () => {
         if (!url || (!url.includes('youtube.com') && !url.includes('youtu.be'))) {
@@ -70,125 +165,57 @@ export default function CapturePage() {
         setScanProgress(0);
 
         try {
-            // STEP 1: PROBE METADATA
             setScanStatus("Connecting to Neural Engine...");
             const metaRes = await fetch(`${BACKEND_URL}/meta?url=${encodeURIComponent(url)}`);
-            if (!metaRes.ok) {
-                const text = await metaRes.text();
-                throw new Error(`Engine Error (${metaRes.status}): ${text.substring(0, 100)}`);
-            }
+            if (!metaRes.ok) throw new Error(`Cloud Engine Busy (502). Please use Deep Scan.`);
             const { duration, interval } = await metaRes.json();
 
-            // ETA Helper
-            let startTime = Date.now();
-            const formatTime = (s) => {
-                if (!s || s < 0) return "0:00";
-                const m = Math.floor(s / 60);
-                const sec = Math.floor(s % 60);
-                return `${m}:${sec.toString().padStart(2, '0')}`;
-            };
-
-            // STEP 2: DETERMINE PARALLEL WORKERS
-            // > 20 mins: 4 Workers (Max Speed)
-            // > 5 mins: 2 Workers
-            let numWorkers = 1;
-            if (duration > 1200) numWorkers = 4;
-            else if (duration > 300) numWorkers = 2;
-
+            let numWorkers = duration > 1200 ? 4 : (duration > 300 ? 2 : 1);
             const chunkDuration = Math.ceil(duration / numWorkers);
-            setScanStatus(`Initializing ${numWorkers} parallel cores...`);
-
-            // Worker State Tracking
             let activeWorkers = numWorkers;
             const workerProgress = new Array(numWorkers).fill(0);
-            const connections = [];
 
-            // STEP 3: LAUNCH WORKERS
             for (let i = 0; i < numWorkers; i++) {
                 const start = i * chunkDuration;
                 const end = Math.min((i + 1) * chunkDuration, duration);
-                const scanUrl = `${BACKEND_URL}/scan?url=${encodeURIComponent(url)}&start=${start}&end=${end}`;
-
-                const es = new EventSource(scanUrl);
-                connections.push(es);
-
-                es.onopen = () => { if (i === 0) startTime = Date.now(); };
+                const es = new EventSource(`${BACKEND_URL}/scan?url=${encodeURIComponent(url)}&start=${start}&end=${end}`);
 
                 es.onmessage = (event) => {
-                    let data;
-                    try {
-                        data = JSON.parse(event.data);
-                    } catch (e) {
-                        console.warn("Received non-JSON SSE data:", event.data);
-                        return;
-                    }
-
-                    if (data.error) {
-                        es.close();
-                        // Only fail if all fail, but for now simple fail
-                        console.error(data.error);
-                        return;
-                    }
-
+                    const data = JSON.parse(event.data);
                     if (data.type === 'progress' || data.type === 'image') {
                         workerProgress[i] = data.progress;
-
-                        // Calculate Total Progress
-                        const totalProgress = workerProgress.reduce((a, b) => a + b, 0) / numWorkers;
-                        setScanProgress(totalProgress);
-
-                        // ETA
-                        let etaString = '';
-                        if (totalProgress > 1 && totalProgress < 100) {
-                            const elapsed = (Date.now() - startTime) / 1000;
-                            const rate = totalProgress / elapsed;
-                            const remaining = (100 - totalProgress) / rate;
-                            etaString = ` • ETA ~${formatTime(remaining)}`;
-                        }
-
-                        if (data.type === 'progress') {
-                            setScanStatus(`Scanning... ${Math.round(totalProgress)}%${etaString}`);
-                        } else {
-                            // Image Found
-                            setScanStatus(`Captured Slide at ${data.timestamp}s${etaString}`);
-                            setScannedImages(prev => {
-                                const newImg = {
-                                    url: data.imageUrl,
-                                    ts: data.timestamp,
-                                    phash: data.phash,
-                                    id: Math.random().toString(36).substr(2, 9)
-                                };
-                                return [...prev, newImg].sort((a, b) => a.ts - b.ts);
-                            });
-
-                            if (autoScrollRef.current) {
-                                setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 100);
-                            }
+                        const total = workerProgress.reduce((a, b) => a + b, 0) / numWorkers;
+                        setScanProgress(total);
+                        if (data.type === 'image') {
+                            setScannedImages(prev => [...prev, {
+                                url: data.imageUrl,
+                                ts: data.timestamp,
+                                phash: data.phash,
+                                id: Math.random().toString(36).substr(2, 9)
+                            }].sort((a, b) => a.ts - b.ts));
                         }
                     }
-
                     if (data.type === 'done') {
                         es.close();
                         activeWorkers--;
-                        workerProgress[i] = 100;
-
-                        if (activeWorkers <= 0) {
-                            setScanStatus(`Completed`);
-                            setStatus('DONE');
-                            setLoading(false);
-                            setScanProgress(100);
-                        }
+                        if (activeWorkers <= 0) { setStatus('DONE'); setLoading(false); }
                     }
                 };
             }
-
         } catch (e) {
-            console.error(e);
             setError(e.message);
-            setLoading(false);
             setStatus('ERROR');
+            setLoading(false);
         }
     };
+
+    const runScan = () => {
+        if (!url) { setError('Please enter a URL'); return; }
+        if (scanMethod === 'extension') handleExtensionScan();
+        else handleScan();
+    };
+
+
 
     // --------------------------------------------------------------------------------
     // SMART TOOLS (AI Clean, Upload, PDF)
@@ -408,8 +435,22 @@ export default function CapturePage() {
                             value={url}
                             onChange={(e) => setUrl(e.target.value)}
                         />
+                        <div className="flex flex-col gap-1 mr-2">
+                            <div className={`text-[10px] font-bold px-2 py-0.5 rounded-full border text-center whitespace-nowrap
+                                ${hasExtension ? 'bg-green-50 text-green-600 border-green-200' : 'bg-gray-50 text-gray-400 border-gray-200'}`}>
+                                {hasExtension ? 'SIDEKICK CONNECTED' : 'SIDEKICK DISCONNECTED'}
+                            </div>
+                            <select
+                                value={scanMethod}
+                                onChange={(e) => setScanMethod(e.target.value)}
+                                className="text-[10px] font-black uppercase text-gray-500 outline-none cursor-pointer bg-transparent"
+                            >
+                                <option value="extension">Deep Scan (Local)</option>
+                                <option value="cloud">Cloud Engine</option>
+                            </select>
+                        </div>
                         <button
-                            onClick={handleScan}
+                            onClick={runScan}
                             disabled={loading}
                             className={`px-8 py-3 rounded-xl font-bold text-white shadow-lg transition-all transform active:scale-95
                                 ${loading ? 'bg-gray-800 cursor-wait' : 'bg-black hover:bg-gray-900 hover:shadow-xl'}
@@ -419,6 +460,7 @@ export default function CapturePage() {
                         </button>
                     </div>
                 </div>
+
 
                 {/* PROGRESS BAR */}
                 {status === 'SCANNING' && (
