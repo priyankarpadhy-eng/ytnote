@@ -73,7 +73,10 @@ export default function CapturePage() {
             // STEP 1: PROBE METADATA
             setScanStatus("Connecting to Neural Engine...");
             const metaRes = await fetch(`${BACKEND_URL}/meta?url=${encodeURIComponent(url)}`);
-            if (!metaRes.ok) throw new Error("Could not connect to scanner backend. Is it running?");
+            if (!metaRes.ok) {
+                const text = await metaRes.text();
+                throw new Error(`Engine Error (${metaRes.status}): ${text.substring(0, 100)}`);
+            }
             const { duration, interval } = await metaRes.json();
 
             // ETA Helper
@@ -112,7 +115,13 @@ export default function CapturePage() {
                 es.onopen = () => { if (i === 0) startTime = Date.now(); };
 
                 es.onmessage = (event) => {
-                    const data = JSON.parse(event.data);
+                    let data;
+                    try {
+                        data = JSON.parse(event.data);
+                    } catch (e) {
+                        console.warn("Received non-JSON SSE data:", event.data);
+                        return;
+                    }
 
                     if (data.error) {
                         es.close();
