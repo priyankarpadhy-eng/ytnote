@@ -1,12 +1,15 @@
 // website-content.js - Runs on global.lecturesnap.online or localhost
 console.log("LectureSnap Website Bridge Loaded ✅");
 
-// 1. Listen for messages from the Web App (CapturePage.jsx)
+// 1. SIGNAL PRESENCE (Standard Extension Signal)
+document.documentElement.dataset.lecturesnapSidekick = "active";
+
+// 2. Listen for messages from the Web App (CapturePage.jsx)
 window.addEventListener("message", (event) => {
     // Basic filtering to ensure we only handle LectureSnap messages
     if (!event.data || typeof event.data !== 'object') return;
 
-    // Handle Ping
+    // Handle Ping (Legacy Support)
     if (event.data.type === "LECTURESNAP_PING") {
         window.postMessage({ type: "LECTURESNAP_PONG" }, "*");
     }
@@ -25,7 +28,7 @@ window.addEventListener("message", (event) => {
     }
 });
 
-// 2. Listen for replies from the Extension (Background Script)
+// 3. Listen for replies from the Extension (Background Script)
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Capture Result
     if (request.type === "EXTENSION_CAPTURE") {

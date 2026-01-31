@@ -55,13 +55,15 @@
             ],
             "js": [
                 "content.js"
-            ]
+            ],
+            "run_at": "document_start"
         },
         {
             "matches": [
                 "*://lecturesnaap.web.app/*",
                 "*://*.lecturesnap.online/*",
-                "http://localhost/*"
+                "http://localhost/*",
+                "http://127.0.0.1/*"
             ],
             "js": [
                 "website-content.js"

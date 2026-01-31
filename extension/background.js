@@ -5,7 +5,8 @@ chrome.sidePanel
 const DASHBOARD_ORIGINS = [
     "https://lecturesnaap.web.app",
     "https://lecturesnap.online",
-    "http://localhost:5173"
+    "http://localhost",
+    "http://127.0.0.1"
 ];
 
 // Broadcast helper
@@ -24,11 +25,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // ACTION: Capture Request (from Web App)
     if (message.action === "remote_capture_request") {
+        console.log("Background: Received remote_capture_request");
         chrome.tabs.query({ url: "*://*.youtube.com/*" }, (tabs) => {
-            if (tabs[0]) {
-                chrome.tabs.sendMessage(tabs[0].id, { action: "trigger_capture" });
+            if (tabs && tabs.length > 0) {
+                // Find active or first available YouTube tab
+                const youtubeTab = tabs.find(t => t.active) || tabs[0];
+                chrome.tabs.sendMessage(youtubeTab.id, { action: "trigger_capture" }).catch(err => {
+                    broadcastToDashboard({ type: "EXTENSION_ERROR", message: "Failed to reach YouTube tab. Is it loaded?" });
+                });
             } else {
-                broadcastToDashboard({ type: "EXTENSION_ERROR", message: "No YouTube tab found" });
+                broadcastToDashboard({ type: "EXTENSION_ERROR", message: "No YouTube tab found. Please open the video in another tab." });
             }
         });
     }
@@ -36,11 +42,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // ACTION: Seek Request (from Web App)
     if (message.action === "remote_seek_request") {
         chrome.tabs.query({ url: "*://*.youtube.com/*" }, (tabs) => {
-            if (tabs[0]) {
-                chrome.tabs.sendMessage(tabs[0].id, {
+            if (tabs && tabs.length > 0) {
+                const youtubeTab = tabs.find(t => t.active) || tabs[0];
+                chrome.tabs.sendMessage(youtubeTab.id, {
                     action: "trigger_seek",
                     timestamp: message.timestamp
-                });
+                }).catch(() => { });
             }
         });
     }
@@ -78,7 +85,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.commands.onCommand.addListener((command) => {
     if (command === 'capture_note') {
         chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            if (tabs[0]) {
+            if (tabs && tabs[0]) {
                 chrome.tabs.sendMessage(tabs[0].id, { action: "trigger_capture" }).catch(() => { });
             }
         });

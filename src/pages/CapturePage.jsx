@@ -39,6 +39,13 @@ export default function CapturePage() {
 
     // Extension Check
     useEffect(() => {
+        // 1. INSTANT CHECK (Dataset attribute set by content script)
+        if (document.documentElement.dataset.lecturesnapSidekick === "active") {
+            setHasExtension(true);
+            setScanMethod('extension');
+        }
+
+        // 2. BACKUP CHECK (Ping/Pong)
         let pingInterval;
         const handleMessage = (event) => {
             if (event.data.type === "LECTURESNAP_PONG") {
@@ -53,6 +60,12 @@ export default function CapturePage() {
         // Ping every second until we get a response
         pingInterval = setInterval(() => {
             window.postMessage({ type: "LECTURESNAP_PING" }, "*");
+            // Also re-check attribute just in case
+            if (document.documentElement.dataset.lecturesnapSidekick === "active") {
+                setHasExtension(true);
+                setScanMethod('extension');
+                clearInterval(pingInterval);
+            }
         }, 1000);
 
         return () => {
