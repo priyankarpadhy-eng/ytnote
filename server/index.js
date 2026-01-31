@@ -5,143 +5,132 @@ const cors = require('cors');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
 
+console.log("--- NEURAL ENGINE STARTUP ---");
+console.log("Time:", new Date().toISOString());
+console.log("Port Environment Variable:", process.env.PORT);
+
 const app = express();
 
-// 1. STRICT CORS POLICY
+// 1. ABSOLUTE FIRST: Global CORS & Preflight
 app.use(cors({
-    origin: '*', // Allow all for development/debugging
+    origin: true, // Echoes back the origin header
+    credentials: true,
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
-// Manual Header Fallback for 502/Proxy bypass
+// 2. MIDDLEWARE FOR LOGGING
 app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
 });
 
 app.use(express.json({ limit: '50mb' }));
 
+// 3. LAZY R2 CLIENT
+let _r2 = null;
+function getR2() {
+    if (_r2) return _r2;
+    console.log("[STORAGE] Initializing R2 Client...");
+    _r2 = new S3Client({
+        region: "auto",
+        endpoint: `https://${process.env.VITE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+        credentials: {
+            accessKeyId: process.env.VITE_R2_ACCESS_KEY_ID,
+            secretAccessKey: process.env.VITE_R2_SECRET_ACCESS_KEY,
+        }
+    });
+    return _r2;
+}
+
 // ---------------------------------------------------------
-// R2 STORAGE SETUP
+// HEALTH & BASIC ROUTES
 // ---------------------------------------------------------
-const r2 = new S3Client({
-    region: "auto",
-    endpoint: `https://${process.env.VITE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-    credentials: {
-        accessKeyId: process.env.VITE_R2_ACCESS_KEY_ID,
-        secretAccessKey: process.env.VITE_R2_SECRET_ACCESS_KEY,
-    }
+app.get('/', (req, res) => res.send('Neural Engine v2.5 (Alive)'));
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        engine: 'Playwright (Stealth)',
+        env: {
+            hasR2: !!process.env.VITE_R2_ACCOUNT_ID,
+            port: process.env.PORT
+        }
+    });
 });
 
-app.get('/', (req, res) => res.send('LectureSnap Neural Engine v2.1 (Ultra Stealth)'));
-app.get('/health', (req, res) => res.json({ status: 'ok', memory: process.memoryUsage() }));
-
 // ---------------------------------------------------------
-// BROWSER SINGLETON (REDUCE RAM USAGE)
+// BROWSER MANAGEMENT (SINGLETON + LAZY)
 // ---------------------------------------------------------
 let sharedBrowser = null;
-let browserLaunchPromise = null;
+let launchInProgress = false;
 
 const LAUNCH_ARGS = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
     '--single-process',
     '--disable-gpu',
-    '--disable-blink-features=AutomationControlled',
-    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    '--no-zygote',
+    '--no-first-run'
 ];
 
 async function getBrowser() {
     if (sharedBrowser) return sharedBrowser;
-    if (browserLaunchPromise) return browserLaunchPromise;
+    if (launchInProgress) {
+        // Simple wait for ongoing launch
+        while (launchInProgress) { await new Promise(r => setTimeout(r, 500)); }
+        if (sharedBrowser) return sharedBrowser;
+    }
 
-    console.log("[SERVER] Launching fresh browser instance...");
-    browserLaunchPromise = chromium.launch({ headless: true, args: LAUNCH_ARGS }).then(b => {
-        sharedBrowser = b;
-        browserLaunchPromise = null;
-        b.on('disconnected', () => {
-            console.log("[SERVER] Browser disconnected, clearing cache.");
+    console.log("[BROWSER] Launching Singleton...");
+    launchInProgress = true;
+    try {
+        sharedBrowser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+        sharedBrowser.on('disconnected', () => {
+            console.log("[BROWSER] Disconnected.");
             sharedBrowser = null;
         });
-        return b;
-    }).catch(err => {
-        console.error("[SERVER] Browser launch FAILED:", err);
-        browserLaunchPromise = null;
+        console.log("[BROWSER] Launched successfully.");
+    } catch (err) {
+        console.error("[BROWSER] LAUNCH ERROR:", err);
         throw err;
-    });
-
-    return browserLaunchPromise;
-}
-
-// ---------------------------------------------------------
-// UTILS
-// ---------------------------------------------------------
-async function calculateDHash(buffer) {
-    try {
-        const { data } = await sharp(buffer).resize(9, 8, { fit: 'fill' }).grayscale().raw().toBuffer({ resolveWithObject: true });
-        let hash = '';
-        for (let y = 0; y < 8; y++) {
-            for (let x = 0; x < 8; x++) {
-                hash += (data[y * 9 + x] > data[y * 9 + x + 1] ? '1' : '0');
-            }
-        }
-        return hash;
-    } catch { return '0'.repeat(64); }
+    } finally {
+        launchInProgress = false;
+    }
+    return sharedBrowser;
 }
 
 // ---------------------------------------------------------
 // ENDPOINTS
 // ---------------------------------------------------------
 app.get('/meta', async (req, res) => {
-    const url = req.query.url;
-    if (!url) return res.status(400).json({ error: 'No URL' });
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: 'Missing URL' });
 
-    let context;
+    let context = null;
     try {
-        console.log(`[META] Probing: ${url}`);
         const browser = await getBrowser();
-        context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 720 }
-        });
-
+        context = await browser.newContext();
         const page = await context.newPage();
 
-        // Speed hack: block everything but HTML
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            if (['document', 'script', 'xhr', 'fetch'].includes(type)) return route.continue();
-            return route.abort();
-        });
+        // Speed tweaks
+        await page.route('**/*.{png,jpg,jpeg,gif,webp,woff,woff2}', r => r.abort());
 
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForSelector('video', { timeout: 15000 });
-
         const duration = await page.evaluate(() => document.querySelector('video')?.duration || 0);
-        const interval = duration < 300 ? 5 : (duration < 900 ? 10 : 20);
 
-        res.json({ duration, interval });
-
+        res.json({ duration, interval: duration > 1200 ? 20 : 10 });
     } catch (e) {
-        console.error("[META ERROR]", e.message);
+        console.error("[META ERROR]", e);
         res.status(500).json({ error: e.message });
     } finally {
-        if (context) await context.close();
+        if (context) await context.close().catch(() => { });
     }
 });
 
 app.get('/scan', async (req, res) => {
-    const { url: videoUrl, start, end } = req.query;
-    const startParam = parseFloat(start) || 0;
-    const endParam = parseFloat(end) || 0;
+    const { url, start, end } = req.query;
 
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -150,75 +139,45 @@ app.get('/scan', async (req, res) => {
         'Access-Control-Allow-Origin': '*'
     });
 
-    let context;
+    let context = null;
     try {
         const browser = await getBrowser();
         context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
         const page = await context.newPage();
 
-        await context.route('**/*', route => {
-            const u = route.request().url();
-            if (u.includes('googleads') || u.includes('analytics')) return route.abort();
-            route.continue();
-        });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForSelector('video', { timeout: 20000 });
 
-        await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForSelector('.html5-video-player', { timeout: 20000 });
+        // Minimal setup
+        await page.addStyleTag({ content: '.ytp-chrome-bottom { display: none !important; }' });
 
-        // Kill overlays
-        await page.addStyleTag({
-            content: `
-            .ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top, .ytp-gradient-bottom,
-            .ytp-watermark, .ytp-ce-element { display: none !important; }
-        `});
+        let currentTime = parseFloat(start) || 10;
+        const endTime = parseFloat(end) || 30;
 
-        const duration = await page.evaluate(() => document.querySelector('video')?.duration || 0);
-        const actualEnd = (endParam > 0 && endParam < duration) ? endParam : duration;
-        const interval = duration < 1200 ? 10 : 20;
-
-        let currentTime = startParam > 0 ? startParam : interval;
-        let lastPhash = null;
-
-        while (currentTime < actualEnd) {
+        while (currentTime < endTime) {
             if (res.writableEnded) break;
 
-            await page.evaluate((t) => {
-                const v = document.querySelector('video');
-                if (v) v.currentTime = t;
-            }, currentTime);
+            await page.evaluate(t => document.querySelector('video').currentTime = t, currentTime);
+            await page.waitForTimeout(600);
 
-            await page.waitForTimeout(500); // Wait for seek render
-
-            const videoElement = await page.$('.html5-video-player');
+            const videoElement = await page.$('.html5-video-player') || await page.$('video');
             const buffer = await videoElement.screenshot({ type: 'jpeg', quality: 70 });
 
-            const currentPhash = await calculateDHash(buffer);
-            const isDuplicate = lastPhash && currentPhash === lastPhash; // Simple check for speed
+            res.write(`data: ${JSON.stringify({
+                type: 'image',
+                imageUrl: `data:image/jpeg;base64,${buffer.toString('base64')}`,
+                timestamp: Math.round(currentTime),
+                progress: Math.round(((currentTime - start) / (end - start)) * 100)
+            })}\n\n`);
 
-            const progress = Math.min(100, Math.round(((currentTime - startParam) / (actualEnd - startParam)) * 100));
-
-            if (!isDuplicate) {
-                lastPhash = currentPhash;
-                res.write(`data: ${JSON.stringify({
-                    type: 'image',
-                    imageUrl: `data:image/jpeg;base64,${buffer.toString('base64')}`,
-                    timestamp: Math.round(currentTime),
-                    progress
-                })}\n\n`);
-            } else {
-                res.write(`data: ${JSON.stringify({ type: 'progress', progress })}\n\n`);
-            }
-
-            currentTime += interval;
+            currentTime += (endTime - start > 1200 ? 25 : 15); // Auto interval
         }
-
         res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-
     } catch (e) {
-        console.error("[SCAN ERROR]", e.message);
+        console.error("[SCAN ERROR]", e);
         res.write(`data: ${JSON.stringify({ type: 'error', error: e.message })}\n\n`);
     } finally {
-        if (context) await context.close();
+        if (context) await context.close().catch(() => { });
         res.end();
     }
 });
@@ -226,15 +185,20 @@ app.get('/scan', async (req, res) => {
 app.post('/upload', async (req, res) => {
     try {
         const { data, fileName } = req.body;
-        const base64Data = data.split(',')[1];
-        const buffer = Buffer.from(base64Data, 'base64');
-        await r2.send(new PutObjectCommand({ Bucket: process.env.VITE_R2_BUCKET_NAME, Key: fileName, Body: buffer, ContentType: 'image/jpeg' }));
+        const buffer = Buffer.from(data.split(',')[1], 'base64');
+        const r2 = getR2();
+        await r2.send(new PutObjectCommand({
+            Bucket: process.env.VITE_R2_BUCKET_NAME,
+            Key: fileName,
+            Body: buffer,
+            ContentType: 'image/jpeg'
+        }));
         res.json({ url: `${process.env.VITE_R2_PUBLIC_URL}/${fileName}` });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 LectureSnap Ultra Stealth Engine running on ${PORT}`);
-    console.log(`📡 Health check: http://localhost:${PORT}/health`);
+    console.log(`\n✅ SERVER ALIVE ON PORT ${PORT}`);
+    console.log(`🌐 Public access via Railway Domain`);
 });
